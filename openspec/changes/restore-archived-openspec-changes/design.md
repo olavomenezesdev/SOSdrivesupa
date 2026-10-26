@@ -1,8 +1,11 @@
 ## Contexto
 
-O OpenSpec deste repositório usa `openspec/changes/` para pacotes de mudança.
-Uma inspeção em 2026-10-17 não encontrou o diretório `openspec/archive/`; logo,
-nenhum pacote arquivado está disponível para ser movido atualmente.
+O OpenSpec deste repositório usa `openspec/changes/` para pacotes de mudança e
+mantém pacotes arquivados em `openspec/changes/archive/`. O inventário de
+2026-10-25 encontrou 13 pacotes: 10 têm todas as tarefas marcadas como
+concluídas e não colidem com mudanças ativas; dois não têm `tasks.md` para
+confirmar a conclusão e um contém tarefas pendentes. Os três últimos devem
+permanecer no arquivo.
 
 ## Objetivos e não objetivos
 
@@ -25,7 +28,7 @@ nenhum pacote arquivado está disponível para ser movido atualmente.
 ## Decisões
 
 1. Fazer primeiro um inventário dos diretórios de mudança sob
-   `openspec/archive/`. Considerar restauráveis os pacotes que estejam
+   `openspec/changes/archive/`. Considerar restauráveis os pacotes que estejam
    concluídos; quando houver `tasks.md`, confirmar que todas as tarefas estão
    marcadas como concluídas.
 2. Mover cada pacote restaurável para `openspec/changes/<nome>`, mantendo toda a
@@ -35,7 +38,7 @@ nenhum pacote arquivado está disponível para ser movido atualmente.
    manual; continuar apenas com os outros pacotes sem conflito.
 4. Não mover pacotes que não possam ser confirmados como concluídos. Reportar
    sua localização e motivo, preservando-os sem alterações.
-5. Remover `openspec/archive/` somente se estiver vazia após a movimentação.
+5. Remover `openspec/changes/archive/` somente se estiver vazia após a movimentação.
    Caso não exista ou não haja pacote elegível, registrar que nenhuma
    movimentação foi necessária.
 6. Registrar em `AGENTS.md` que mudanças concluídas devem permanecer em
@@ -59,14 +62,14 @@ nenhum pacote arquivado está disponível para ser movido atualmente.
 
 ## Plano de migração
 
-1. Inventariar `openspec/archive/`, se existir, e registrar os pacotes elegíveis,
+1. Inventariar `openspec/changes/archive/`, se existir, e registrar os pacotes elegíveis,
    incompletos e conflitantes.
 2. Restaurar os pacotes concluídos e sem colisões para `openspec/changes/`.
 3. Remover o diretório de arquivo apenas se ficar vazio.
 4. Confirmar que cada pacote restaurado mantém seus arquivos e conteúdo.
 
 Nenhum dado de produto é alterado. O rollback consiste em mover os pacotes
-restaurados de volta para `openspec/archive/` após confirmar que não foram
+restaurados de volta para `openspec/changes/archive/` após confirmar que não foram
 editados desde a restauração.
 
 ## Verificação
@@ -76,5 +79,5 @@ editados desde a restauração.
   conteúdo e que nenhum pacote foi sobrescrito.
 - Confirmar que pacotes incompletos ou conflitantes foram preservados e
   reportados.
-- Confirmar que `openspec/archive/` foi removido somente quando ficou vazio.
+- Confirmar que `openspec/changes/archive/` foi removido somente quando ficou vazio.
 - Executar a validação OpenSpec quando a CLI estiver disponível.

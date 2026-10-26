@@ -46,6 +46,7 @@ class TestRoleProfile(unittest.TestCase):
         state = AuthState.__new__(AuthState)
         object.__setattr__(state, "dirty_vars", set())
         object.__setattr__(state, "auth_token", "valid-token")
+        object.__setattr__(state, "auth_refresh_token", "valid-refresh-token")
         object.__setattr__(state, "user_id", "")
         object.__setattr__(state, "user", {})
         object.__setattr__(state, "user_json", "")
@@ -53,18 +54,17 @@ class TestRoleProfile(unittest.TestCase):
         object.__setattr__(state, "user_full_name", "Ana")
         object.__setattr__(state, "user_email", "ana@exemplo.com")
         object.__setattr__(state, "session_validated", False)
-        response = Mock(status_code=200)
-        response.content = b'{"id": 29, "email": "ana@exemplo.com", "role": "cliente"}'
-        response.json.return_value = {"id": 29, "email": "ana@exemplo.com", "role": "cliente"}
-
-        with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
-            patch("sosdrive.requests.get", return_value=response),
-        ):
+        restored_session = Mock(
+            access_token="new-access-token",
+            refresh_token="new-refresh-token",
+            user={"id": "29", "email": "ana@exemplo.com", "role": "cliente"},
+        )
+        with patch("sosdrive.restore_supabase_session", return_value=restored_session):
             state.load_current_user()
 
         self.assertEqual(state.user_id, "29")
         self.assertEqual(state.user_role, "cliente")
+        self.assertEqual(state.auth_refresh_token, "new-refresh-token")
 
     def test_signup_sets_duplicate_email_message_from_backend_conflict(self):
         self.assertTrue(
@@ -98,7 +98,7 @@ class TestRoleProfile(unittest.TestCase):
         pending_provider_requests.clear()
         try:
             object.__setattr__(state, "_get_auth_token", AsyncMock(return_value="token-123"))
-            with patch("sosdrive.request_service_xano", return_value={"request_id": 99, "status": "queued", "estimated_price": 150.0, "distance_km": 4.4}):
+            with patch("sosdrive.create_service_request_supabase", return_value={"request_id": 99, "status": "pending", "estimated_price": 150.0, "distance_km": 4.4}):
                 asyncio.run(state._submit_customer_request("tire"))
 
             self.assertEqual(state.request_status, "searching")

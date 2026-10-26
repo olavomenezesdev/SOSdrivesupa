@@ -80,7 +80,7 @@ rules:
 
   specs:
     - Usar terminologia consistente com docs/domain-model.md (não renomear entidades livremente)
-    - Descrever regras estruturais importantes (ex.: status do Chamado, unicidade da Avaliação por Chamado, um prestador por Chamado por vez)
+    - "Descrever regras estruturais importantes (ex.: status do Chamado, unicidade da Avaliação por Chamado, um prestador por Chamado por vez)"
     - Usar formato Given/When/Then para cenários funcionais, quando aplicável
     - Especificar regras de autorização envolvidas (quem pode ver/alterar o quê)
 

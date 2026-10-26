@@ -42,6 +42,9 @@ nunca apenas no frontend/Reflex.
 Mudanças devem utilizar OpenSpec
 (proposta de spec antes da implementação,
 conforme fluxo já adotado no projeto).
+Pacotes concluídos devem permanecer em
+`openspec/changes/`; não os arquivar em
+`openspec/changes/archive/` ao finalizar.
 ```
 
 ## Testes

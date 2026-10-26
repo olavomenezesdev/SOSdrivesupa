@@ -21,10 +21,12 @@ def make_profile_state(**overrides):
     object.__setattr__(state, "dirty_vars", set())
     values = {
         "auth_token": "auth-token",
+        "auth_refresh_token": "refresh-token",
         "user_id": "42",
         "user_role": "cliente",
         "user_full_name": "Beatriz Alves",
         "user_profile_photo": "https://cdn.example/saved.png",
+        "user_profile_photo_path": "profiles/42/avatar.png",
         "selected_profile_image": "",
         "selected_profile_filename": "",
         "selected_profile_uploaded_url": "",
@@ -122,18 +124,17 @@ class TestProfilePhotoPreview(unittest.TestCase):
             selected_profile_filename="picked.jpg",
         )
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
             patch(
-                "sosdrive.upload_user_profile_photo",
-                return_value="https://xano.example/vault/picked.jpg",
+                "sosdrive.upload_profile_photo_supabase",
+                return_value="profiles/42/avatar.jpg",
             ),
-            patch("sosdrive.save_user_profile", side_effect=requests.ConnectionError),
+            patch("sosdrive.save_profile_supabase", side_effect=requests.ConnectionError),
         ):
             state.save_profile()
 
         self.assertEqual(state.selected_profile_image, staged_image)
         self.assertEqual(state.selected_profile_filename, "picked.jpg")
-        self.assertEqual(state.selected_profile_uploaded_url, "https://xano.example/vault/picked.jpg")
+        self.assertEqual(state.selected_profile_uploaded_url, "profiles/42/avatar.jpg")
         self.assertEqual(state.profile_photo_preview, staged_image)
         self.assertFalse(state.profile_is_loading)
         self.assertEqual(state.profile_message, "")
@@ -146,12 +147,11 @@ class TestProfilePhotoPreview(unittest.TestCase):
             selected_profile_filename="picked.jpg",
         )
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
             patch(
-                "sosdrive.upload_user_profile_photo",
+                "sosdrive.upload_profile_photo_supabase",
                 side_effect=requests.ConnectionError,
             ),
-            patch("sosdrive.save_user_profile") as save_profile,
+            patch("sosdrive.save_profile_supabase") as save_profile,
         ):
             state.save_profile()
 
@@ -164,32 +164,35 @@ class TestProfilePhotoPreview(unittest.TestCase):
 
     def test_retry_reuses_photo_url_when_profile_save_failed(self):
         staged_image = build_image_data_url("picked.jpg", JPEG_BYTES)
-        photo_url = "https://xano.example/vault/picked.jpg"
+        photo_path = "profiles/42/avatar.jpg"
         state = make_profile_state(
             selected_profile_image=staged_image,
             selected_profile_filename="picked.jpg",
         )
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
             patch(
-                "sosdrive.upload_user_profile_photo",
-                return_value=photo_url,
+                "sosdrive.upload_profile_photo_supabase",
+                return_value=photo_path,
             ) as upload_photo,
             patch(
-                "sosdrive.save_user_profile",
+                "sosdrive.save_profile_supabase",
                 side_effect=[
                     requests.ConnectionError,
-                    {"foto_perfil": photo_url},
+                    {
+                        "foto_perfil": "https://cdn.example/picked.jpg",
+                        "foto_perfil_path": photo_path,
+                    },
                 ],
             ) as save_profile,
+            patch("sosdrive.delete_profile_photo_supabase"),
         ):
             state.save_profile()
             state.save_profile()
 
         upload_photo.assert_called_once()
         self.assertEqual(save_profile.call_count, 2)
-        self.assertEqual(save_profile.call_args.args[2]["foto_perfil"], photo_url)
-        self.assertEqual(state.user_profile_photo, photo_url)
+        self.assertEqual(save_profile.call_args.args[1]["foto_perfil"], photo_path)
+        self.assertEqual(state.user_profile_photo, "https://cdn.example/picked.jpg")
         self.assertEqual(state.selected_profile_image, "")
         self.assertEqual(state.selected_profile_uploaded_url, "")
         self.assertEqual(state.profile_message, "Dados atualizados com sucesso.")
@@ -202,27 +205,29 @@ class TestProfilePhotoPreview(unittest.TestCase):
             selected_profile_image="",
         )
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
             patch(
-                "sosdrive.save_user_profile",
-                return_value={"nome_completo": "Beatriz Alves"},
+                "sosdrive.save_profile_supabase",
+                return_value={
+                    "nome_completo": "Beatriz Alves",
+                    "foto_perfil": "https://cdn.example/saved.png",
+                    "foto_perfil_path": "profiles/42/avatar.png",
+                },
             ) as save_profile,
-            patch("sosdrive.upload_user_profile_photo") as upload_photo,
+            patch("sosdrive.upload_profile_photo_supabase") as upload_photo,
         ):
             state.save_profile()
 
-        payload = save_profile.call_args.args[2]
+        payload = save_profile.call_args.args[1]
         self.assertEqual(
             payload,
             {
                 "nome_completo": "Beatriz Alves",
                 "cpf": "12345678901",
                 "telefone": "11999999999",
-                "foto_perfil": "https://cdn.example/saved.png",
+                "foto_perfil": "profiles/42/avatar.png",
             },
         )
         self.assertTrue(all(isinstance(value, str) for value in payload.values()))
-        self.assertEqual(save_profile.call_args.args[3], "PUT")
         upload_photo.assert_not_called()
         self.assertEqual(state.profile_message, "Dados atualizados com sucesso.")
         self.assertFalse(state.profile_is_loading)
@@ -230,30 +235,26 @@ class TestProfilePhotoPreview(unittest.TestCase):
     def test_save_profile_creates_profile_without_requiring_user_id_in_url(self):
         state = make_profile_state(profile_exists=False, user_id="")
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
-            patch("sosdrive.save_user_profile", return_value={}) as save_profile,
+            patch("sosdrive.save_profile_supabase", return_value={}) as save_profile,
         ):
             state.save_profile()
 
-        self.assertEqual(save_profile.call_args.args[1], "https://xano.example/api")
-        self.assertEqual(save_profile.call_args.args[3], "POST")
         self.assertEqual(save_profile.call_args.args[0], state.auth_token)
 
     def test_save_profile_converts_missing_optional_fields_to_empty_strings(self):
         state = make_profile_state(user_cpf=None, user_phone=None)
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
-            patch("sosdrive.save_user_profile", return_value={}) as save_profile,
+            patch("sosdrive.save_profile_supabase", return_value={}) as save_profile,
         ):
             state.save_profile()
 
         self.assertEqual(
-            save_profile.call_args.args[2],
+            save_profile.call_args.args[1],
             {
                 "nome_completo": "Beatriz Alves",
                 "cpf": "",
                 "telefone": "",
-                "foto_perfil": "https://cdn.example/saved.png",
+                "foto_perfil": "profiles/42/avatar.png",
             },
         )
 
@@ -264,26 +265,29 @@ class TestProfilePhotoPreview(unittest.TestCase):
             selected_profile_filename="picked.jpg",
         )
         with (
-            patch.dict("os.environ", {"XANO_API_URL": "https://xano.example/api"}),
             patch(
-                "sosdrive.save_user_profile",
-                return_value={"foto_perfil": "https://cdn.example/picked.jpg"},
+                "sosdrive.save_profile_supabase",
+                return_value={
+                    "foto_perfil": "https://cdn.example/picked.jpg",
+                    "foto_perfil_path": "profiles/42/avatar.jpg",
+                },
             ) as save_profile,
             patch(
-                "sosdrive.upload_user_profile_photo",
-                return_value="https://cdn.example/picked.jpg",
+                "sosdrive.upload_profile_photo_supabase",
+                return_value="profiles/42/avatar.jpg",
             ) as upload_photo,
+            patch("sosdrive.delete_profile_photo_supabase"),
         ):
             state.save_profile()
 
         uploaded_file = upload_photo.call_args.args[2]
         self.assertEqual(
-            save_profile.call_args.args[2],
+            save_profile.call_args.args[1],
             {
                 "nome_completo": "Beatriz Alves",
                 "cpf": "",
                 "telefone": "",
-                "foto_perfil": "https://cdn.example/picked.jpg",
+                "foto_perfil": "profiles/42/avatar.jpg",
             },
         )
         self.assertEqual(uploaded_file["name"], "picked.jpg")

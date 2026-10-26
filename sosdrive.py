@@ -18,6 +18,32 @@ from urllib.parse import urlsplit
 from collections.abc import Callable
 
 from dotenv import load_dotenv
+from supabase_backend import (
+    SupabaseAuthenticationError,
+    SupabaseBackendError,
+    SupabaseConfigurationRuntimeError,
+    SupabaseSession,
+    accept_service_request as accept_service_request_supabase,
+    cancel_service_request as cancel_service_request_supabase,
+    complete_service_request as complete_service_request_supabase,
+    create_service_request as create_service_request_supabase,
+    delete_profile_photo as delete_profile_photo_supabase,
+    delete_vehicle as delete_vehicle_supabase,
+    fetch_pending_requests as fetch_pending_requests_supabase,
+    fetch_service_request as fetch_service_request_supabase,
+    fetch_service_messages as fetch_service_messages_supabase,
+    fetch_user_vehicles as fetch_user_vehicles_supabase,
+    get_profile as get_profile_supabase,
+    release_service_request as release_service_request_supabase,
+    resend_signup_confirmation as resend_signup_confirmation_supabase,
+    restore_session as restore_supabase_session,
+    save_profile as save_profile_supabase,
+    save_vehicle as save_vehicle_supabase,
+    send_service_message as send_service_message_supabase,
+    sign_in as sign_in_supabase,
+    sign_up as sign_up_supabase,
+    upload_profile_photo as upload_profile_photo_supabase,
+)
 
 from styles import GLOBAL_STYLE, COLORS
 
@@ -33,7 +59,7 @@ def _load_project_environment(env_file: Path | None = None) -> bool:
 _load_project_environment()
 
 logger = logging.getLogger(__name__)
-pending_provider_requests: list[dict] = [] # Deprecated: Use Xano polling
+pending_provider_requests: list[dict] = [] # Deprecated: provider requests are loaded from Supabase.
 LOGIN_BACKGROUND_VIDEO_URL = "/Pippit_0924_TruckTracking.mp4"
 
 
@@ -664,7 +690,12 @@ class AuthState(rx.State):
     signup_email: str = ""
     signup_password: str = ""
     signup_role: str = "cliente"
+    pending_confirmation_email: str = ""
+    resend_message: str = ""
+    resend_cooldown_until: int = 0
+    is_resending_confirmation: bool = False
     auth_token: str = ""
+    auth_refresh_token: str = ""
     user_json: str = ""
     user: dict = {}
     user_id: str = ""
@@ -674,8 +705,9 @@ class AuthState(rx.State):
     active_call_status: str | None = None
     active_call_eta: str = "15 min"
 
-    # Profile Fields (Mock)
+    # Profile fields
     user_profile_photo: str = ""
+    user_profile_photo_path: str = ""
     selected_profile_image: str = ""
     selected_profile_filename: str = ""
     selected_profile_uploaded_url: str = ""
@@ -708,6 +740,10 @@ class AuthState(rx.State):
         """Return the staged profile image before the persisted photo."""
         return self.selected_profile_image or self.user_profile_photo
 
+    @rx.var(interval=1)
+    def resend_seconds_remaining(self) -> int:
+        return max(0, self.resend_cooldown_until - int(time.time()))
+
     def open_signup(self) -> None:
         return rx.redirect("/signup")
 
@@ -727,8 +763,12 @@ class AuthState(rx.State):
     def set_signup_password(self, value: str) -> None:
         self.signup_password = value
 
-    def signup(self) -> None:
+    @rx.event
+    async def signup(self):
+        if self.is_loading:
+            return
         self.signup_message = ""
+        self.resend_message = ""
         self.error_message = ""
 
         clean_name = (self.signup_name or "").strip()
@@ -746,38 +786,98 @@ class AuthState(rx.State):
             self.signup_password = ""
             return
         self.is_loading = True
-        api_url = self.get_xano_api_url()
-        if not api_url:
-            self.error_message = "Não foi possível criar sua conta. Tente novamente."
-            self.signup_password = ""
-            self.is_loading = False
-            return
-
+        yield
         try:
-            auth_token, user_id = signup_with_xano(
-                clean_name,
+            session = await asyncio.to_thread(
+                sign_up_supabase,
                 clean_email,
                 clean_password,
+                clean_name,
                 self.signup_role,
-                api_url,
             )
-            self.auth_token = auth_token
-            self.user_id = str(user_id)
-            self.load_current_user()
-            self.signup_name = ""
-            self.signup_email = ""
-            self.signup_password = ""
-            return self.redirect_to_user_home()
+            self.clear_session()
+            self.email = clean_email
+            if session is not None:
+                self.error_message = (
+                    "O cadastro foi aceito sem exigir confirmação de e-mail. "
+                    "Verifique a configuração Auth do projeto Supabase."
+                )
+                self.pending_confirmation_email = ""
+                return
+            self.pending_confirmation_email = clean_email
+            self.signup_message = (
+                f"Enviamos um e-mail de confirmação para {clean_email}. "
+                "Confirme para entrar. Olhe também a caixa de spam."
+            )
+            return
+        except SupabaseConfigurationRuntimeError:
+            self.error_message = (
+                "O destino de confirmação não está configurado corretamente neste ambiente."
+            )
         except SignupConflictError:
             self.error_message = "Este e-mail já está cadastrado. Faça login ou tente outro."
-        except XanoAPIError as error:
-            self.error_message = error.message or "Não foi possível criar sua conta. Tente novamente."
-        except (requests.RequestException, RuntimeError, ValueError) as error:
-            logger.exception("Xano signup request failed: %s", error)
-            self.error_message = "Não foi possível conectar ao Xano. Tente novamente."
+        except SupabaseBackendError as error:
+            if error.status_code == 409:
+                self.error_message = "Este e-mail já está cadastrado. Faça login ou tente outro."
+            elif error.status_code == 400:
+                self.error_message = (
+                    "O Supabase recusou o cadastro (HTTP 400). Confira o formato do e-mail, "
+                    "a senha mínima e se cadastro por e-mail está habilitado nas configurações Auth."
+                )
+                logger.error("Supabase signup failed status=%s", error.status_code)
+            elif error.status_code == 429:
+                self.error_message = "Muitas tentativas. Aguarde alguns minutos e tente novamente."
+                logger.warning("Supabase signup rate limited status=%s", error.status_code)
+            else:
+                logger.error("Supabase signup failed status=%s", error.status_code)
+                self.error_message = "Não foi possível criar sua conta. Tente novamente."
+        except (RuntimeError, ValueError) as error:
+            logger.exception("Supabase signup failed category=%s", type(error).__name__)
+            self.error_message = "Não foi possível conectar ao Supabase. Tente novamente."
         finally:
             self.signup_password = ""
             self.is_loading = False
+
+    @rx.event
+    async def resend_confirmation_email(self):
+        if self.is_loading or self.is_resending_confirmation:
+            return
+        seconds_remaining = max(
+            0,
+            self.resend_cooldown_until - int(time.time()),
+        )
+        if seconds_remaining:
+            return
+
+        email = (self.pending_confirmation_email or self.email).strip().lower()
+        if not email:
+            self.resend_message = "Informe seu e-mail para reenviar a confirmação."
+            return
+
+        self.resend_message = ""
+        self.is_resending_confirmation = True
+        yield
+        try:
+            await asyncio.to_thread(resend_signup_confirmation_supabase, email)
+            self.pending_confirmation_email = email
+            self.resend_cooldown_until = int(time.time()) + 60
+            self.resend_message = "E-mail de confirmação reenviado. Confira também a caixa de spam."
+        except SupabaseBackendError as error:
+            if error.status_code == 429:
+                self.resend_cooldown_until = int(time.time()) + 60
+                self.resend_message = (
+                    "Muitas tentativas. Aguarde alguns minutos e tente novamente."
+                )
+                logger.warning("Supabase confirmation resend rate limited status=%s", error.status_code)
+            elif error.status_code == 503:
+                self.resend_message = (
+                    "O destino de confirmação não está configurado corretamente neste ambiente."
+                )
+            else:
+                logger.error("Supabase confirmation resend failed status=%s", error.status_code)
+                self.resend_message = "Não foi possível reenviar o e-mail. Tente novamente mais tarde."
+        finally:
+            self.is_resending_confirmation = False
 
     def set_email_value(self, value: str) -> None:
         self.email = value
@@ -802,29 +902,27 @@ class AuthState(rx.State):
         self.signup_message = ""
         return rx.redirect("/login")
 
-    def get_xano_api_url(self) -> str:
-        configured_url = os.getenv("XANO_API_URL", "")
-        if not configured_url.strip():
-            return ""
-        return configured_url.strip().rstrip("/")
-
-    def set_authenticated_user(self, auth_token: str, user: dict) -> None:
-        self.auth_token = auth_token
+    def _set_supabase_session(self, session: SupabaseSession) -> None:
+        self.auth_token = session.access_token
+        self.auth_refresh_token = session.refresh_token
         self.session_validated = True
-        self.user = user
-        self.user_json = json.dumps(user)
-        self.user_id = str(user.get("id", ""))
-        self.user_role = normalize_user_role(user.get("role"))
-        self.user_full_name = user.get("name", self.user_full_name)
-        self.user_email = user.get("email", self.user_email)
+        self.user = session.user
+        self.user_json = json.dumps(session.user)
+        self.user_id = str(session.user.get("id", ""))
+        self.user_role = normalize_user_role(session.user.get("role"))
+        self.user_full_name = session.user.get("name") or self.user_full_name
+        self.user_email = session.user.get("email") or self.user_email
+        self.user_profile_photo_path = session.user.get("foto_perfil") or ""
 
     def clear_session(self) -> None:
         self.auth_token = ""
+        self.auth_refresh_token = ""
         self.user_json = ""
         self.user = {}
         self.user_id = ""
         self.user_role = "cliente"
         self.user_profile_photo = ""
+        self.user_profile_photo_path = ""
         self.selected_profile_image = ""
         self.selected_profile_filename = ""
         self.selected_profile_uploaded_url = ""
@@ -842,15 +940,12 @@ class AuthState(rx.State):
         return rx.redirect("/login")
 
     def load_current_user(self) -> None:
-        """Load the authenticated user using the stored token and, when available, the cached user ID."""
-        if not self.auth_token:
+        """Restore and validate the Supabase session and its role-bearing profile."""
+        if not self.auth_token or not self.auth_refresh_token:
             raise RuntimeError("Authentication session is incomplete")
-
-        user = fetch_authenticated_user(self.auth_token, self.get_xano_api_url(), self.user_id)
-        response_user_id = user.get("id") or user.get("user_id")
-        if response_user_id is not None:
-            self.user_id = str(response_user_id)
-        self.set_authenticated_user(self.auth_token, user)
+        self._set_supabase_session(
+            restore_supabase_session(self.auth_token, self.auth_refresh_token)
+        )
 
     def redirect_to_user_home(self):
         if self.user_role == "prestador":
@@ -865,7 +960,7 @@ class AuthState(rx.State):
         raise UnsupportedRoleError()
 
     def restore_session(self):
-        """Restore the persisted user and validate the token with Xano."""
+        """Restore and refresh the persisted Supabase session."""
         self.session_validated = False
         if not self.auth_token:
             # Instead of immediately expiring, we can let them stay on the loading screen
@@ -884,119 +979,54 @@ class AuthState(rx.State):
 
             self.load_current_user()
             self.session_validated = True
-        except (requests.RequestException, RuntimeError, ValueError, UnsupportedRoleError) as e:
-            logger.error("Session restoration failed: %s", e)
+        except (SupabaseBackendError, RuntimeError, ValueError, UnsupportedRoleError) as error:
+            logger.error("Supabase session restoration failed category=%s", type(error).__name__)
             return self.expire_session()
 
     @rx.event
     async def login(self):
-        """Authenticate through Xano without retaining the submitted password."""
-        if self.is_loading:
+        """Authenticate through Supabase without retaining the submitted password."""
+        if self.is_loading or self.is_resending_confirmation:
             return
         self.error_message = ""
         self.is_loading = True
-        connection_error = (
-            "Erro ao conectar com o servidor Xano. "
-            "Verifique a URL do endpoint ou sua conexão com a internet."
-        )
-        phase = "configuration"
-        endpoint = ""
-
         yield
         redirect_event = None
         try:
-            api_url = self.get_xano_api_url()
-            if not api_url:
-                raise XanoConfigurationError("missing")
-            phase = "login"
-            endpoint = f"{api_url}/auth/login"
-            auth_token, user_id = await asyncio.to_thread(
-                login_with_xano,
-                self.email,
-                self.password,
-                api_url,
-            )
-            phase = "user_lookup"
-            endpoint = f"{api_url}/auth/me"
-            user = await asyncio.to_thread(
-                fetch_authenticated_user,
-                auth_token,
-                api_url,
-                str(user_id),
-            )
-            self.auth_token = auth_token
-            self.user_id = str(user_id)
-            self.set_authenticated_user(auth_token, user)
+            session = await asyncio.to_thread(sign_in_supabase, self.email, self.password)
+            self._set_supabase_session(session)
             redirect_event = self.redirect_to_user_profile()
         except UnsupportedRoleError:
             self.clear_session()
             self.error_message = "Sua conta não possui um tipo de usuário válido."
-        except InvalidCredentialsError as error:
+        except SupabaseAuthenticationError as error:
             self.clear_session()
-            self.error_message = error.message or "E-mail ou senha incorretos."
-        except XanoConfigurationError as error:
-            self.clear_session()
-            logger.error("Xano login configuration failure setting=XANO_API_URL reason=%s", error.reason)
-            if error.reason == "missing":
+            if error.message == "Email confirmation is still enabled in Supabase Auth":
+                self.pending_confirmation_email = self.email.strip().lower()
                 self.error_message = (
-                    "XANO_API_URL não está configurada. Crie `.env` na raiz do projeto, "
-                    "copie o modelo de `.env.example`, informe a URL base do grupo Xano "
-                    "e reinicie o backend."
+                    "Seu e-mail ainda não foi confirmado. Confirme pelo link enviado "
+                    "ou reenvie a confirmação abaixo."
                 )
             else:
-                self.error_message = (
-                    "XANO_API_URL inválida. Use uma URL base HTTP(S) do grupo Xano, "
-                    "por exemplo https://<workspace>.xano.io/api:<grupo>."
-                )
-        except XanoMalformedResponseError as error:
+                self.error_message = "E-mail ou senha incorretos."
+        except SupabaseConfigurationRuntimeError:
             self.clear_session()
-            safe_endpoint = _safe_xano_endpoint(endpoint)
-            logger.error(
-                "Xano login malformed response endpoint=%s status=%s",
-                safe_endpoint,
-                error.status_code,
-            )
-            self.error_message = (
-                "O Xano respondeu, mas os dados de autenticação estão inválidos. "
-                "Confira os endpoints /auth/login e /auth/me no grupo configurado."
-            )
-        except XanoAPIError as error:
+            self.error_message = "Supabase não está configurado corretamente neste ambiente."
+        except SupabaseBackendError as error:
             self.clear_session()
-            safe_endpoint = _safe_xano_endpoint(endpoint)
-            logger.error(
-                "Xano login HTTP failure endpoint=%s status=%s",
-                safe_endpoint,
-                error.status_code,
-            )
-            if phase == "login" and error.status_code in {400, 401, 403}:
-                self.error_message = error.message or "E-mail ou senha incorretos."
-            else:
-                self.error_message = (
-                    f"O Xano respondeu com erro HTTP {error.status_code} em "
-                    f"{urlsplit(safe_endpoint).path or '/auth/login'}. "
-                    "Confira a URL base, o grupo e a publicação desse endpoint."
-                )
+            logger.error("Supabase login failed status=%s", error.status_code)
+            self.error_message = "Não foi possível entrar. Verifique sua conexão e tente novamente."
         except requests.RequestException as error:
             self.clear_session()
-            safe_endpoint = _safe_xano_endpoint(endpoint) if endpoint else "<XANO_API_URL>"
-            logger.warning(
-                "Xano login transport failure endpoint=%s exception=%s",
-                safe_endpoint,
-                type(error).__name__,
-            )
-            self.error_message = connection_error
+            logger.warning("Supabase login transport failure exception=%s", type(error).__name__)
+            self.error_message = "Erro ao conectar com o Supabase. Verifique sua conexão e tente novamente."
         except (RuntimeError, ValueError) as error:
             self.clear_session()
-            safe_endpoint = _safe_xano_endpoint(endpoint) if endpoint else "<XANO_API_URL>"
             logger.error(
-                "Xano login unexpected failure endpoint=%s category=%s",
-                safe_endpoint,
+                "Supabase login unexpected failure category=%s",
                 type(error).__name__,
             )
-            self.error_message = (
-                "Não foi possível processar a resposta do Xano. "
-                "Confira a configuração do endpoint e os logs do servidor."
-            )
+            self.error_message = "Não foi possível processar a resposta do Supabase. Tente novamente."
         finally:
             self.password = ""
             self.is_loading = False
@@ -1022,27 +1052,26 @@ class AuthState(rx.State):
         """Load the current user's profile without exposing auth data."""
         if not self.auth_token:
             return
-        api_url = self.get_xano_api_url()
-        if not api_url:
-            self.profile_error = "O perfil ainda não está configurado neste ambiente."
-            return
         self.profile_error = ""
         try:
-            profile = fetch_user_profile(self.auth_token, api_url)
+            profile = get_profile_supabase(self.auth_token, self.auth_refresh_token)
             self.profile_exists = bool(profile)
             self.user_full_name = profile.get("nome_completo") or self.user_full_name
             self.user_cpf = format_cpf(profile.get("cpf", ""))
             self.user_phone = format_phone(profile.get("telefone", ""))
             self.user_profile_photo = profile.get("foto_perfil") or self.user_profile_photo
+            self.user_profile_photo_path = profile.get("foto_perfil_path") or ""
             self.selected_profile_uploaded_url = ""
-        except requests.HTTPError as error:
-            if error.response is not None and error.response.status_code == 401:
+        except SupabaseBackendError as error:
+            if error.status_code == 401:
                 return self.expire_session()
+            logger.error("Supabase profile load failed status=%s", error.status_code)
             self.profile_error = "Não foi possível carregar seu perfil. Tente novamente."
-        except requests.RequestException:
+        except requests.RequestException as error:
+            logger.error("Supabase profile load transport failure category=%s", type(error).__name__)
             self.profile_error = "Não foi possível carregar seu perfil. Tente novamente."
         except ValueError:
-            self.profile_error = "O perfil retornado pelo Xano é inválido."
+            self.profile_error = "O perfil retornado pelo Supabase é inválido."
 
     def save_profile(self) -> None:
         """Create or update only the profile owned by the current token."""
@@ -1065,11 +1094,8 @@ class AuthState(rx.State):
         if not self.auth_token:
             self.profile_error = "Sua sessão expirou. Entre novamente."
             return
-        api_url = self.get_xano_api_url()
-        if not api_url:
-            self.profile_error = "O perfil ainda não está configurado neste ambiente."
-            return
         self.profile_is_loading = True
+        previous_photo_path = self.user_profile_photo_path
         profile_file = None
         if self.selected_profile_image and not self.selected_profile_uploaded_url:
             try:
@@ -1098,16 +1124,17 @@ class AuthState(rx.State):
 
         try:
             if profile_file:
-                self.selected_profile_uploaded_url = upload_user_profile_photo(
+                self.selected_profile_uploaded_url = upload_profile_photo_supabase(
                     self.auth_token,
-                    api_url,
+                    self.auth_refresh_token,
                     profile_file,
+                    self.user_id,
                 )
 
             photo_value = (
                 self.selected_profile_uploaded_url
                 if self.selected_profile_image
-                else str(self.user_profile_photo or "").strip()
+                else self.user_profile_photo_path
             )
             payload = {
                 "nome_completo": full_name,
@@ -1115,29 +1142,47 @@ class AuthState(rx.State):
                 "telefone": phone,
                 "foto_perfil": photo_value,
             }
-            profile = save_user_profile(
+            profile = save_profile_supabase(
                 self.auth_token,
-                api_url,
                 payload,
-                "PUT" if self.profile_exists else "POST",
+                self.auth_refresh_token,
             )
+            new_photo_path = profile.get("foto_perfil_path") or photo_value
+            photo_cleanup_warning = False
+            if previous_photo_path and previous_photo_path != new_photo_path:
+                try:
+                    delete_profile_photo_supabase(
+                        self.auth_token,
+                        self.auth_refresh_token,
+                        previous_photo_path,
+                    )
+                except SupabaseBackendError as error:
+                    logger.error("Supabase old profile photo cleanup failed status=%s", error.status_code)
+                    photo_cleanup_warning = True
             self.profile_exists = True
             self.user_full_name = str(profile.get("nome_completo") or full_name)
             self.user_cpf = format_cpf(str(profile.get("cpf") or cpf))
             self.user_phone = format_phone(str(profile.get("telefone") or phone))
             self.user_profile_photo = profile.get("foto_perfil") or photo_value or self.user_profile_photo
+            self.user_profile_photo_path = new_photo_path
             self.selected_profile_image = ""
             self.selected_profile_filename = ""
             self.selected_profile_uploaded_url = ""
-            self.profile_message = "Dados atualizados com sucesso."
-        except XanoAPIError as error:
+            self.profile_message = (
+                "Dados atualizados. Não foi possível remover a foto anterior."
+                if photo_cleanup_warning
+                else "Dados atualizados com sucesso."
+            )
+        except SupabaseBackendError as error:
             if error.status_code == 401:
                 return self.expire_session()
-            self.profile_error = error.message
-        except requests.RequestException:
+            logger.error("Supabase profile save failed status=%s", error.status_code)
+            self.profile_error = "Não foi possível salvar seu perfil. Tente novamente."
+        except requests.RequestException as error:
+            logger.error("Supabase profile save transport failure category=%s", type(error).__name__)
             self.profile_error = "Não foi possível salvar seu perfil. Tente novamente."
         except ValueError:
-            self.profile_error = "O perfil retornado pelo Xano é inválido."
+            self.profile_error = "O perfil retornado pelo Supabase é inválido."
         finally:
             self.profile_is_loading = False
 
@@ -1195,6 +1240,9 @@ class OperationalState(rx.State):
     ]
     is_available: bool = True
     available_requests: list[dict] = []
+    pending_requests_loading: bool = False
+    pending_requests_error: str = ""
+    pending_requests_polling: bool = False
     selected_request: dict = {}
     atendimento_mock: dict = {}
     atendimento_phase: str = ""
@@ -1208,6 +1256,10 @@ class OperationalState(rx.State):
     show_message_panel: bool = False
     client_message_draft: str = ""
     client_message_error: str = ""
+
+    @rx.var
+    def has_available_requests(self) -> bool:
+        return bool(self.available_requests)
     show_client_message_panel: bool = False
 
 
@@ -1228,9 +1280,7 @@ class OperationalState(rx.State):
     # Provider identity (simulated)
     current_provider_id: int = 1
     current_provider_specialties: list[str] = ["tire", "battery"]
-    user_vehicles: list[dict] = [
-        {"id": 1, "brand": "Toyota", "model": "Corolla", "plate": "ABC-1234", "year": 2020, "color": "Prata"},
-    ]
+    user_vehicles: list[dict] = []
     # Modal state for vehicles
     show_vehicle_modal: bool = False
     editing_vehicle_id: int | None = None
@@ -1243,6 +1293,10 @@ class OperationalState(rx.State):
     async def _get_auth_token(self) -> str:
         auth_state = await self.get_state(AuthState)
         return auth_state.auth_token
+
+    async def _get_auth_identity(self) -> tuple[str, str]:
+        auth_state = await self.get_state(AuthState)
+        return auth_state.auth_token, auth_state.user_id
 
     @rx.var
     def vehicle_options(self) -> list[str]:
@@ -1297,9 +1351,20 @@ class OperationalState(rx.State):
     def set_v_color(self, v: str):
         self.v_color = v
 
-    def delete_vehicle(self, vehicle_id: int):
-        """Remove a vehicle from the local mock list."""
-        self.user_vehicles = [v for v in self.user_vehicles if v["id"] != vehicle_id]
+    async def delete_vehicle(self, vehicle_id: int):
+        """Delete an owned vehicle through Supabase."""
+        token = await self._get_auth_token()
+        if not token:
+            return AuthState.expire_session()
+        try:
+            await asyncio.to_thread(delete_vehicle_supabase, token, vehicle_id)
+            self.user_vehicles = [v for v in self.user_vehicles if v["id"] != vehicle_id]
+            return rx.toast("Veículo removido com sucesso.")
+        except SupabaseBackendError as error:
+            logger.error("Supabase vehicle deletion failed status=%s", error.status_code)
+            if error.status_code == 401:
+                return AuthState.expire_session()
+            return rx.toast("Não foi possível remover o veículo. Tente novamente.")
 
     def open_vehicle_modal(self, vehicle_id: int | None = None):
         """Open modal for creating or editing a vehicle."""
@@ -1329,7 +1394,7 @@ class OperationalState(rx.State):
         self.editing_vehicle_id = None
 
     async def save_vehicle(self):
-        """Save a vehicle through Xano and refresh the profile list."""
+        """Save a vehicle through Supabase and refresh the profile list."""
         if not self.v_plate or not self.v_brand or not self.v_model:
             return rx.toast("Preencha marca, modelo e placa.")
 
@@ -1337,7 +1402,6 @@ class OperationalState(rx.State):
         if not isinstance(token, str) or not token.strip():
             return AuthState.expire_session()
 
-        api_url = get_xano_services_url()
         payload = {
             "brand": self.v_brand,
             "model": self.v_model,
@@ -1346,24 +1410,22 @@ class OperationalState(rx.State):
             "color": self.v_color,
         }
         try:
-            response = requests.post(
-                f"{api_url}/vehicles",
-                json=payload,
-                headers=_auth_headers(token),
-                timeout=10,
+            await asyncio.to_thread(
+                save_vehicle_supabase,
+                token,
+                payload,
+                self.editing_vehicle_id,
             )
-            if response.status_code >= 400:
-                raise XanoAPIError(response.status_code, _response_message(response))
             await self.load_user_vehicles()
             self.close_vehicle_modal()
             return rx.toast("Veículo cadastrado com sucesso!")
-        except XanoAPIError as error:
-            logger.error("Failed to save vehicle status=%s error=%s", error.status_code, error.message)
+        except SupabaseBackendError as error:
+            logger.error("Supabase vehicle save failed status=%s", error.status_code)
             if error.status_code == 401:
                 return AuthState.expire_session()
             return rx.toast("Não foi possível salvar o veículo. Tente novamente.")
-        except Exception as error:
-            logger.exception("Failed to save vehicle: %s", error)
+        except (requests.RequestException, ValueError) as error:
+            logger.error("Supabase vehicle save failed category=%s", type(error).__name__)
             return rx.toast("Não foi possível salvar o veículo. Tente novamente.")
 
     async def load_user_vehicles(self):
@@ -1374,14 +1436,14 @@ class OperationalState(rx.State):
             return
 
         try:
-            self.user_vehicles = fetch_user_vehicles_xano(token, get_xano_services_url())
-        except XanoAPIError as error:
-            logger.error("Failed to load user vehicles status=%s error=%s", error.status_code, error.message)
+            self.user_vehicles = fetch_user_vehicles_supabase(token)
+        except SupabaseBackendError as error:
+            logger.error("Failed to load user vehicles status=%s", error.status_code)
             self.user_vehicles = []
             if error.status_code == 401:
                 return AuthState.expire_session()
-        except Exception as error:
-            logger.exception("Failed to load user vehicles: %s", error)
+        except (requests.RequestException, ValueError) as error:
+            logger.error("Failed to load user vehicles category=%s", type(error).__name__)
             self.user_vehicles = []
 
 
@@ -1393,9 +1455,21 @@ class OperationalState(rx.State):
                 p["status"] = "online" if self.is_available else "offline"
         self.providers = list(self.providers)
 
-    def _map_xano_to_ui_request(self, xano_req: dict) -> dict:
-        """Convert a Xano request object to the UI format expected by available_requests."""
-        service_type = xano_req.get("service_type", "other")
+    @staticmethod
+    def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Return the great-circle distance between two coordinates in kilometers."""
+        lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
+        delta_lat = lat2 - lat1
+        delta_lon = lon2 - lon1
+        haversine = (
+            math.sin(delta_lat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+        )
+        return 6371.0 * 2 * math.asin(math.sqrt(min(1.0, haversine)))
+
+    def _map_service_request_to_ui(self, request_data: dict) -> dict:
+        """Convert a Supabase service request to the provider queue UI format."""
+        service_type = request_data.get("service_type", "other")
 
         # Mapping service types to friendly names and icons
         type_map = {
@@ -1410,16 +1484,22 @@ class OperationalState(rx.State):
         # Calculate distance from provider's current location
         provider_lat = self.provider_locations.get(self.current_provider_id, {}).get("lat", self.providers[0]["coords"][0] if self.providers else -23.55)
         provider_lng = self.provider_locations.get(self.current_provider_id, {}).get("lng", self.providers[0]["coords"][1] if self.providers else -46.63)
-        req_lat = xano_req.get("latitude", 0.0)
-        req_lng = xano_req.get("longitude", 0.0)
+        req_lat = request_data.get("latitude", 0.0)
+        req_lng = request_data.get("longitude", 0.0)
 
         dist_km = self._haversine(provider_lat, provider_lng, req_lat, req_lng)
 
         # Construct Google Maps URL
         maps_url = f"https://www.google.com/maps/dir/?api=1&destination={req_lat},{req_lng}"
-        user_record = xano_req.get("_user") or xano_req.get("user") or {}
-        vehicle_record = xano_req.get("_vehicle") or xano_req.get("vehicle") or {}
-        vehicle_details = xano_req.get("vehicle_details") or vehicle_record.get("details")
+        user_record = request_data.get("_user") or request_data.get("user") or {}
+        vehicle_record = request_data.get("_vehicle") or request_data.get("vehicle") or {}
+        vehicle_details = request_data.get("vehicle_details") or vehicle_record.get("details")
+        if not vehicle_details:
+            vehicle_details = " ".join(
+                str(request_data.get(field, "")).strip()
+                for field in ("vehicle_brand", "vehicle_model", "vehicle_plate")
+                if request_data.get(field)
+            )
         if not vehicle_details and vehicle_record:
             vehicle_details = " ".join(
                 str(vehicle_record.get(field, "")).strip()
@@ -1428,41 +1508,145 @@ class OperationalState(rx.State):
             )
 
         return {
-            "id": xano_req.get("id"),
+            "id": request_data.get("id"),
             "type": friendly_name,
             "service_icon": icon,
-            "user": user_record.get("name") or xano_req.get("user_name") or xano_req.get("name") or "Usuário",
-            "phone": format_phone(user_record.get("phone") or xano_req.get("user_phone") or xano_req.get("phone") or ""),
+            "user": user_record.get("name") or request_data.get("user_name") or request_data.get("name") or "Usuário",
+            "phone": format_phone(user_record.get("phone") or request_data.get("user_phone") or request_data.get("phone") or ""),
             "vehicle": vehicle_details or "Veículo não informado",
-            "note": xano_req.get("note") or "Sem observações.",
+            "note": request_data.get("note") or "Sem observações.",
             "distance": f"{dist_km:.1f} km",
             "eta": f"{int(dist_km * 3 + 5)} min", # Simple mock ETA based on distance
-            "address": xano_req.get("address") or "Endereço não informado",
+            "address": request_data.get("address") or "Endereço não informado",
             "coords": [req_lat, req_lng],
             "maps_url": maps_url,
         }
 
     @rx.event(background=True)
     async def poll_pending_requests(self):
-        """Background task that fetches real pending requests from Xano every 20 seconds."""
+        """Background task that fetches pending Supabase requests every 20 seconds."""
+        async with self:
+            if self.pending_requests_polling:
+                return
+            self.pending_requests_polling = True
+            if not self.available_requests:
+                self.pending_requests_loading = True
+
         while True:
             async with self:
                 token = await self._get_auth_token()
-                if not token:
-                    logger.warning("Polling skipped: No auth token available")
-                    await asyncio.sleep(10)
-                    continue
+            if not token:
+                async with self:
+                    self.pending_requests_loading = False
+                    self.pending_requests_error = (
+                        "Sua sessão expirou. Entre novamente para carregar os chamados."
+                    )
+                logger.warning("Polling skipped: No auth token available")
+                await asyncio.sleep(10)
+                continue
 
-                try:
-                    logger.info("Polling pending requests from Xano...")
-                    raw_requests = fetch_pending_requests_xano(token, get_xano_services_url())
-                    mapped_requests = [self._map_xano_to_ui_request(r) for r in raw_requests]
+            try:
+                raw_requests = await asyncio.to_thread(
+                    fetch_pending_requests_supabase,
+                    token,
+                )
+                mapped_requests = [
+                    self._map_service_request_to_ui(request)
+                    for request in raw_requests
+                ]
+                async with self:
                     self.available_requests = mapped_requests
-                    logger.info("Successfully polled %s pending requests from Xano", len(mapped_requests))
-                except Exception as e:
-                    logger.error("Failed to poll pending requests: %s", e)
+                    self.pending_requests_error = ""
+                    self.pending_requests_loading = False
+                logger.info("Polled %s pending Supabase requests", len(mapped_requests))
+            except SupabaseBackendError as error:
+                async with self:
+                    self.pending_requests_error = (
+                        "Não foi possível carregar os chamados próximos. Tente novamente."
+                    )
+                    self.pending_requests_loading = False
+                logger.error("Failed to poll pending requests status=%s", error.status_code)
+            except (requests.RequestException, ValueError) as error:
+                async with self:
+                    self.pending_requests_error = (
+                        "Não foi possível carregar os chamados próximos. Tente novamente."
+                    )
+                    self.pending_requests_loading = False
+                logger.error("Failed to poll pending requests category=%s", type(error).__name__)
 
             await asyncio.sleep(20)
+
+    @rx.event
+    async def load_pending_requests(self):
+        """Load provider-home requests once and expose loading/error states."""
+        if self.pending_requests_loading:
+            return
+        self.pending_requests_loading = True
+        self.pending_requests_error = ""
+        yield
+        try:
+            token = await self._get_auth_token()
+            if not token:
+                self.pending_requests_error = (
+                    "Sua sessão expirou. Entre novamente para carregar os chamados."
+                )
+                return
+            raw_requests = await asyncio.to_thread(
+                fetch_pending_requests_supabase,
+                token,
+            )
+            self.available_requests = [
+                self._map_service_request_to_ui(request)
+                for request in raw_requests
+            ]
+        except SupabaseBackendError as error:
+            self.pending_requests_error = (
+                "Não foi possível carregar os chamados próximos. Tente novamente."
+            )
+            logger.error("Provider home request load failed status=%s", error.status_code)
+        except (requests.RequestException, ValueError) as error:
+            self.pending_requests_error = (
+                "Não foi possível carregar os chamados próximos. Tente novamente."
+            )
+            logger.error(
+                "Provider home request load failed category=%s",
+                type(error).__name__,
+            )
+        finally:
+            self.pending_requests_loading = False
+
+    @rx.event(background=True)
+    async def poll_service_request_status(self):
+        """Watch the authenticated client's active request until a provider accepts it."""
+        while True:
+            async with self:
+                if self.request_status != "searching" or self.request_id is None:
+                    request_id = None
+                else:
+                    request_id = self.request_id
+                token = await self._get_auth_token()
+
+            if request_id is not None and token:
+                try:
+                    request = await asyncio.to_thread(
+                        fetch_service_request_supabase,
+                        token,
+                        request_id,
+                    )
+                    if request and request.get("provider_id"):
+                        async with self:
+                            if self.request_id == request_id and self.request_status == "searching":
+                                self.request_server_status = str(request.get("status") or "accepted")
+                                self.request_status = "matched"
+                except SupabaseBackendError as error:
+                    logger.error("Client request status poll failed status=%s", error.status_code)
+                    if error.status_code == 401:
+                        async with self:
+                            return AuthState.expire_session()
+                except (requests.RequestException, ValueError) as error:
+                    logger.error("Client request status poll failed category=%s", type(error).__name__)
+
+            await asyncio.sleep(5)
 
     def refresh_available_requests(self):
         """Now handled by background polling, but kept for compatibility."""
@@ -1470,41 +1654,27 @@ class OperationalState(rx.State):
 
 
     async def accept_request(self, request_id: int):
-        """Select a request, update status in Xano, and start attendance flow."""
-        # DIAGNOSTIC LOG: Check what ID is actually being passed to the function
-        logger.info("--- ACCEPT REQUEST ATTEMPT ---")
-        logger.info("Request ID received from frontend: %s", request_id)
-
+        """Accept a pending request through Supabase and start attendance."""
         request = next((item for item in self.available_requests if item["id"] == request_id), None)
         if request is None:
-            logger.warning("Request ID %s not found in available_requests list", request_id)
             return rx.toast("Solicitação não encontrada na lista local.")
 
         token = await self._get_auth_token()
         if not token:
-            logger.error("No auth token available for accept_request")
             return AuthState.expire_session()
 
         try:
-            logger.info("Attempting to update Xano status for ID %s to 'accepted'...", request_id)
-            accept_service_request_xano(
-                auth_token=token,
-                api_url=get_xano_services_url(),
-                request_id=request_id,
-            )
-            logger.info("Successfully updated status in Xano for ID %s", request_id)
-        except XanoAPIError as error:
-            logger.error("Xano API Error during accept_request: status=%s", error.status_code)
+            await asyncio.to_thread(accept_service_request_supabase, token, request_id)
+        except SupabaseBackendError as error:
+            logger.error("Supabase request acceptance failed status=%s", error.status_code)
             if error.status_code == 401:
                 return AuthState.expire_session()
-            if error.status_code == 404:
+            if error.status_code in {400, 404, 409}:
                 return rx.toast("Este chamado não está mais disponível.")
-            if error.status_code == 400:
-                return rx.toast("Os dados do chamado são inválidos.")
             return rx.toast("Não foi possível aceitar o chamado. Tente novamente.")
-        except Exception as error:
-            logger.exception("Unexpected error accepting request %s: %s", request_id, error)
-            return rx.toast("Ocorreu um erro inesperado ao processar a aceitação.")
+        except (requests.RequestException, ValueError) as error:
+            logger.error("Supabase request acceptance failed category=%s", type(error).__name__)
+            return rx.toast("Não foi possível aceitar o chamado. Tente novamente.")
 
         self.selected_request = request
 
@@ -1517,7 +1687,6 @@ class OperationalState(rx.State):
         self.show_cancel_confirm = False
         self.available_requests = [item for item in self.available_requests if item["id"] != request_id]
 
-        logger.info("Request %s accepted and redirected to progress screen", request_id)
         return rx.redirect("/provider-service-progress")
 
     def refuse_request(self, request_id: int):
@@ -1526,8 +1695,7 @@ class OperationalState(rx.State):
         return rx.toast("Solicitação recusada.")
 
     def reset_provider_home(self):
-        """Restore the provider home presentation after returning from details."""
-        self.is_available = True
+        """Clear transient selection without changing provider availability."""
         self.selected_request = {}
 
     def reset_atendimento(self):
@@ -1598,28 +1766,22 @@ class OperationalState(rx.State):
         self.show_cancel_confirm = False
 
     async def confirm_cancel_atendimento(self):
-        """Cancel attendance, revert status to pending in Xano, and return to provider home."""
+        """Release the active request through Supabase and return to provider home."""
         request_id = self.atendimento_mock.get("id")
         token = await self._get_auth_token()
 
         if request_id and token:
             try:
-                # Revert status to 'pending' so other providers can see it again
-                release_service_request_xano(
-                    auth_token=token,
-                    api_url=get_xano_services_url(),
-                    request_id=request_id,
-                )
-            except Exception as error:
-                logger.error("Failed to revert request status to pending: %s", error)
-                # We continue with local cleanup even if API fails to avoid locking the UI,
-                # but in a production app we might want to warn the user.
+                await asyncio.to_thread(release_service_request_supabase, token, request_id)
+            except SupabaseBackendError as error:
+                logger.error("Supabase request release failed status=%s", error.status_code)
+                return rx.toast("Não foi possível liberar o chamado. Tente novamente.")
 
         self.reset_atendimento()
         return rx.redirect("/home_provider")
 
     async def advance_atendimento_phase(self):
-        """Advance through mock attendance phases in strict sequence."""
+        """Advance the attendance flow and persist completion in Supabase."""
         request_id = self.atendimento_mock.get("id")
         token = await self._get_auth_token()
 
@@ -1633,13 +1795,11 @@ class OperationalState(rx.State):
             self.atendimento_phase = "CONCLUIDO"
             if request_id and token:
                 try:
-                    complete_service_request_xano(
-                        auth_token=token,
-                        api_url=get_xano_services_url(),
-                        request_id=request_id,
-                    )
-                except Exception as error:
-                    logger.error("Failed to update status to completed: %s", error)
+                    await asyncio.to_thread(complete_service_request_supabase, token, request_id)
+                except SupabaseBackendError as error:
+                    logger.error("Supabase request completion failed status=%s", error.status_code)
+                    self.atendimento_phase = "ATENDENDO"
+                    return rx.toast("Não foi possível concluir o chamado. Tente novamente.")
             return rx.redirect("/service-finalized")
 
     def finish_atendimento_and_back_home(self):
@@ -1724,14 +1884,17 @@ class OperationalState(rx.State):
             return rx.toast("Erro: Dados de atendimento insuficientes.")
 
         try:
-            send_service_message_xano(
-                auth_token=token,
-                api_url=get_xano_services_url(),
-                request_id=request_id,
-                message_text="Cheguei ao local!"
+            await asyncio.to_thread(
+                send_service_message_supabase,
+                token,
+                request_id,
+                "Cheguei ao local!",
             )
             return rx.toast("Cliente notificado da sua chegada!")
-        except Exception as error:
+        except SupabaseBackendError as error:
+            logger.error("Supabase arrival notification failed status=%s", error.status_code)
+            return rx.toast("Erro ao enviar notificação. Tente novamente.")
+        except (requests.RequestException, ValueError) as error:
             logger.error("Failed to send arrival notification category=%s", type(error).__name__)
             return rx.toast("Erro ao enviar notificação. Tente novamente.")
 
@@ -1756,7 +1919,7 @@ class OperationalState(rx.State):
         self.message_draft = value
 
     async def load_service_messages(self):
-        """Load the current service request conversation from Xano."""
+        """Load the current service request conversation from Supabase."""
         request_id = self.atendimento_mock.get("id")
         token = await self._get_auth_token()
         if not request_id or not token:
@@ -1766,13 +1929,12 @@ class OperationalState(rx.State):
 
         try:
             self.service_messages = await asyncio.to_thread(
-                fetch_service_messages_xano,
+                fetch_service_messages_supabase,
                 token,
-                get_xano_services_url(),
                 request_id,
             )
             self.message_sync_status = "Atualização automática ativa."
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error("Failed to load service messages status=%s", error.status_code)
             self.message_error = "Não foi possível carregar as mensagens."
             self.message_sync_status = "Conexão instável. Tentando novamente automaticamente."
@@ -1810,12 +1972,11 @@ class OperationalState(rx.State):
 
         try:
             refreshed_messages = await asyncio.to_thread(
-                fetch_service_messages_xano,
+                fetch_service_messages_supabase,
                 token,
-                get_xano_services_url(),
                 expected_request_id,
             )
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error("Failed to refresh service messages status=%s", error.status_code)
             async with self:
                 if (
@@ -1880,16 +2041,15 @@ class OperationalState(rx.State):
 
         try:
             message = await asyncio.to_thread(
-                send_service_message_xano,
+                send_service_message_supabase,
                 token,
-                get_xano_services_url(),
                 request_id,
                 message_text,
             )
             self.service_messages = [*self.service_messages, message]
             self.message_draft = ""
             self.message_error = ""
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error("Failed to send service message status=%s", error.status_code)
             self.message_error = "Não foi possível enviar a mensagem."
         except (requests.RequestException, ValueError) as error:
@@ -1927,13 +2087,12 @@ class OperationalState(rx.State):
 
         try:
             self.service_messages = await asyncio.to_thread(
-                fetch_service_messages_xano,
+                fetch_service_messages_supabase,
                 token,
-                get_xano_services_url(),
                 self.request_id,
             )
             self.message_sync_status = "Atualização automática ativa."
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error("Failed to load client messages status=%s", error.status_code)
             self.client_message_error = "Não foi possível carregar as mensagens."
             self.message_sync_status = "Conexão instável. Tentando novamente automaticamente."
@@ -1955,16 +2114,15 @@ class OperationalState(rx.State):
 
         try:
             message = await asyncio.to_thread(
-                send_service_message_xano,
+                send_service_message_supabase,
                 token,
-                get_xano_services_url(),
                 self.request_id,
                 message_text,
             )
             self.service_messages = [*self.service_messages, message]
             self.client_message_draft = ""
             self.client_message_error = ""
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error("Failed to send client message status=%s", error.status_code)
             self.client_message_error = "Não foi possível enviar a mensagem."
         except (requests.RequestException, ValueError) as error:
@@ -1988,11 +2146,11 @@ class OperationalState(rx.State):
 
     @rx.event
     async def submit_customer_request(self, service_type: str):
-        """Start a real service request through Xano."""
+        """Start a service request through Supabase."""
         return await self._submit_customer_request(service_type)
 
     async def _submit_customer_request(self, service_type: str):
-        """Validate request inputs and call Xano without affecting other flows."""
+        """Validate request inputs and create the Supabase service request."""
         self.request_error_message = ""
         self.show_profile_link = False
 
@@ -2027,13 +2185,13 @@ class OperationalState(rx.State):
         self.selected_service = service_type
         self.request_status = "searching"
         try:
-            result = request_service_xano(
-                auth_token=token,
-                api_url=get_xano_services_url(),
-                service_type=service_type,
-                vehicle_id=int(self.selected_vehicle_id),
-                latitude=latitude,
-                longitude=longitude,
+            result = await asyncio.to_thread(
+                create_service_request_supabase,
+                token,
+                service_type,
+                int(self.selected_vehicle_id),
+                latitude,
+                longitude,
             )
             self.request_id = result.get("request_id")
             self.request_server_status = str(result.get("status", ""))
@@ -2044,11 +2202,10 @@ class OperationalState(rx.State):
             # actively searching. Only real acceptance should expose it to providers.
             pending_provider_requests[:] = []
             return
-        except XanoAPIError as error:
+        except SupabaseBackendError as error:
             logger.error(
-                "Request service failed status=%s error=%s",
+                "Request service failed status=%s",
                 error.status_code,
-                error.message,
             )
             self.request_status = "idle"
             if error.status_code == 401:
@@ -2060,8 +2217,8 @@ class OperationalState(rx.State):
             else:
                 self.request_error_message = "Não foi possível processar sua solicitação."
             return rx.toast(self.request_error_message)
-        except Exception as error:
-            logger.exception("Request service failed: %s", error)
+        except (requests.RequestException, ValueError) as error:
+            logger.error("Request service failed category=%s", type(error).__name__)
             self.request_status = "idle"
             self.request_error_message = "Não foi possível processar sua solicitação."
             return rx.toast(self.request_error_message)
@@ -2095,9 +2252,26 @@ class OperationalState(rx.State):
         """Private method to simulate finding a provider."""
         self.request_status = "matched"
 
-    def set_request_status(self, status: str):
-        """Update the request status."""
-        self.request_status = status
+    async def set_request_status(self, status: str):
+        """Cancel a searching request before resetting its local presentation state."""
+        if status != "idle":
+            raise ValueError("Unsupported local request status transition")
+        if self.request_id is not None:
+            token = await self._get_auth_token()
+            if not token:
+                return AuthState.expire_session()
+            try:
+                await asyncio.to_thread(
+                    cancel_service_request_supabase,
+                    token,
+                    self.request_id,
+                )
+            except SupabaseBackendError as error:
+                logger.error("Supabase request cancellation failed status=%s", error.status_code)
+                return rx.toast("Não foi possível cancelar o chamado. Tente novamente.")
+        self.request_status = "idle"
+        self.request_id = None
+        self.request_server_status = ""
 
     def set_provider_name(self, name: str):
         """Update the name of the current simulated provider."""
@@ -2333,6 +2507,43 @@ def brand_header() -> rx.Component:
     )
 
 
+def resend_confirmation_controls() -> rx.Component:
+    return rx.cond(
+        AuthState.pending_confirmation_email != "",
+        rx.vstack(
+            rx.button(
+                rx.cond(
+                    AuthState.is_resending_confirmation,
+                    "Enviando...",
+                    rx.cond(
+                        AuthState.resend_seconds_remaining > 0,
+                        rx.text(
+                            "Reenviar em ",
+                            AuthState.resend_seconds_remaining,
+                            " s",
+                        ),
+                        "Reenviar e-mail de confirmação",
+                    ),
+                ),
+                on_click=AuthState.resend_confirmation_email,
+                class_name="secondary-button",
+                width="100%",
+                disabled=(
+                    AuthState.is_loading
+                    | AuthState.is_resending_confirmation
+                    | (AuthState.resend_seconds_remaining > 0)
+                ),
+            ),
+            rx.cond(
+                AuthState.resend_message != "",
+                rx.text(AuthState.resend_message, class_name="success-message"),
+            ),
+            width="100%",
+            spacing="2",
+        ),
+    )
+
+
 def signup_screen() -> rx.Component:
     return rx.center(
         rx.vstack(
@@ -2392,6 +2603,7 @@ def signup_screen() -> rx.Component:
                         type="submit",
                         class_name="primary-button",
                         width="100%",
+                        disabled=AuthState.is_loading,
                     ),
                     rx.cond(
                         AppState.error_message != "",
@@ -2407,6 +2619,7 @@ def signup_screen() -> rx.Component:
                 on_submit=AuthState.signup,
                 width="100%",
             ),
+            resend_confirmation_controls(),
             rx.button(
                 "Já tenho uma conta",
                 on_click=AppState.open_login,
@@ -2445,6 +2658,10 @@ def login_screen() -> rx.Component:
                 rx.text("acesso seguro", class_name="section-kicker"),
                 rx.heading("Entre para continuar.", class_name="section-title", size="8"),
                 rx.text("Use seu email e senha para acessar a SOS Drive.", class_name="section-intro"),
+                rx.cond(
+                    AppState.signup_message != "",
+                    rx.text(AppState.signup_message, class_name="success-message"),
+                ),
                 rx.form(
                     rx.vstack(
                         text_input("Email", "voce@exemplo.com", AppState.email, AppState.set_email_value),
@@ -2477,6 +2694,7 @@ def login_screen() -> rx.Component:
                             AppState.error_message != "",
                             rx.text(AppState.error_message, class_name="error-message"),
                         ),
+                        resend_confirmation_controls(),
                         width="100%",
                         spacing="5",
                     ),
@@ -2941,6 +3159,7 @@ def customer_dashboard() -> rx.Component:
                 "window.triggerReflexUpdate({ role: 'client', lat: lat, lng: lng }); "
                 "});"
             ),
+            OperationalState.poll_service_request_status,
         ],
     )
 
@@ -3495,16 +3714,38 @@ def user_home_screen() -> rx.Component:
             # 4. Bottom Section (Location Context - status text only)
             rx.vstack(
                 rx.hstack(
-                    rx.text("📍 Localização Atual", weight="bold", font_size="0.9rem", color=COLORS["navy"]),
+                    rx.text(
+                        "📍 Localização Atual",
+                        weight="bold",
+                        font_size="0.9rem",
+                        color=COLORS["navy"],
+                    ),
                     rx.spacer(),
-                    rx.text("✅ Nenhum chamado ativo", font_size="0.75rem", color="#22C55E", weight="bold"),
+                    rx.cond(
+                        AppState.active_call_status == None,
+                        rx.text("Sem chamado ativo", font_size="0.75rem", color=COLORS["muted"], weight="bold"),
+                        rx.text("Chamado em andamento", font_size="0.75rem", color="#C2410C", weight="bold"),
+                    ),
                     width="100%",
-                    margin_bottom="1rem",
                     align="center",
+                ),
+                rx.cond(
+                    AppState.active_call_status == None,
+                    rx.text(
+                        "Você ainda não tem um chamado em andamento. Solicite socorro quando precisar.",
+                        font_size="0.8rem",
+                        color=COLORS["muted"],
+                    ),
+                    rx.text(
+                        "Acompanhe o atendimento pelo botão acima.",
+                        font_size="0.8rem",
+                        color=COLORS["muted"],
+                    ),
                 ),
                 align="start",
                 width="100%",
                 margin_top="3rem",
+                spacing="2",
             ),
             align="start",
             spacing="6",
@@ -3678,47 +3919,119 @@ def provider_home_screen() -> rx.Component:
                             margin_bottom="1rem",
                         ),
                         rx.vstack(
-                            rx.foreach(
-                                OperationalState.available_requests,
-                                lambda r: rx.hstack(
-                                    rx.box(
-                                        rx.text(r["service_icon"], font_size="1.8rem"),
-                                        width="3rem",
-                                        height="3rem",
-                                        display="flex",
-                                        align_items="center",
-                                        justify_content="center",
-                                        background="#FFF7ED",
-                                        border_radius="12px",
-                                        flex_shrink="0",
-                                    ),
+                            rx.cond(
+                                OperationalState.pending_requests_loading
+                                & ~OperationalState.has_available_requests,
+                                rx.center(
                                     rx.vstack(
-                                        rx.text(r["type"], weight="bold", color=COLORS["navy"]),
-                                        rx.text(f"👤 {r['user']} • 📍 {r['distance']}", font_size="0.8rem", color=COLORS["text"]),
-                                        align="start",
-                                        spacing="1",
-                                    ),
-                                    rx.spacer(),
-                                    rx.hstack(
-                                        rx.button("Aceitar", on_click=lambda: OperationalState.accept_request(r["id"]), class_name="primary-button", size="1"),
-                                        rx.button("Recusar", on_click=lambda: OperationalState.refuse_request(r["id"]), class_name="secondary-button", size="1"),
-                                        spacing="2",
+                                        rx.spinner(),
+                                        rx.text(
+                                            "Carregando chamados próximos...",
+                                            color=COLORS["muted"],
+                                        ),
+                                        align="center",
+                                        spacing="3",
                                     ),
                                     width="100%",
-                                    padding="1rem",
-                                    background="white",
-                                    border=f"1px solid {COLORS['line']}",
-                                    border_radius="12px",
-                                    box_shadow="0 4px 12px rgba(15,23,42,0.08)",
-                                    spacing="3",
+                                    min_height="12rem",
+                                ),
+                                rx.cond(
+                                    OperationalState.pending_requests_error != "",
+                                    rx.center(
+                                        rx.vstack(
+                                            rx.text(
+                                                OperationalState.pending_requests_error,
+                                                color=COLORS["muted"],
+                                                text_align="center",
+                                            ),
+                                            rx.button(
+                                                "Tentar novamente",
+                                                on_click=OperationalState.load_pending_requests,
+                                                class_name="secondary-button",
+                                            ),
+                                            align="center",
+                                            spacing="3",
+                                        ),
+                                        width="100%",
+                                        min_height="12rem",
+                                    ),
+                                    rx.cond(
+                                        OperationalState.has_available_requests,
+                                        rx.vstack(
+                                            rx.foreach(
+                                                OperationalState.available_requests,
+                                                lambda r: rx.hstack(
+                                                    rx.box(
+                                                        rx.text(r["service_icon"], font_size="1.8rem"),
+                                                        width="3rem",
+                                                        height="3rem",
+                                                        display="flex",
+                                                        align_items="center",
+                                                        justify_content="center",
+                                                        background="#FFF7ED",
+                                                        border_radius="12px",
+                                                        flex_shrink="0",
+                                                    ),
+                                                    rx.vstack(
+                                                        rx.text(r["type"], weight="bold", color=COLORS["navy"]),
+                                                        rx.text(f"👤 {r['user']} • 📍 {r['distance']}", font_size="0.8rem", color=COLORS["text"]),
+                                                        align="start",
+                                                        spacing="1",
+                                                    ),
+                                                    rx.spacer(),
+                                                    rx.hstack(
+                                                        rx.button("Aceitar", on_click=lambda: OperationalState.accept_request(r["id"]), class_name="primary-button", size="1"),
+                                                        rx.button("Recusar", on_click=lambda: OperationalState.refuse_request(r["id"]), class_name="secondary-button", size="1"),
+                                                        spacing="2",
+                                                    ),
+                                                    width="100%",
+                                                    padding="1rem",
+                                                    background="white",
+                                                    border=f"1px solid {COLORS['line']}",
+                                                    border_radius="12px",
+                                                    box_shadow="0 4px 12px rgba(15,23,42,0.08)",
+                                                    spacing="3",
+                                                ),
+                                            ),
+                                            spacing="4",
+                                            width="100%",
+                                        ),
+                                        rx.center(
+                                            rx.vstack(
+                                                rx.text(
+                                                    "Nenhum chamado ou cliente próximo no momento",
+                                                    weight="bold",
+                                                    color=COLORS["navy"],
+                                                    text_align="center",
+                                                ),
+                                                rx.text(
+                                                    "Você receberá novas solicitações quando houver chamados na sua região.",
+                                                    color=COLORS["muted"],
+                                                    text_align="center",
+                                                ),
+                                                align="center",
+                                                spacing="2",
+                                            ),
+                                            width="100%",
+                                            min_height="12rem",
+                                        ),
+                                    ),
                                 ),
                             ),
-                            spacing="4",
                             width="100%",
                         ),
                     ),
                     rx.center(
-                        rx.text("Você está indisponível para novos chamados", weight="bold", color=COLORS["muted"]),
+                        rx.vstack(
+                            rx.text("Você está indisponível para novos chamados", weight="bold", color=COLORS["muted"]),
+                            rx.text(
+                                "Ative sua disponibilidade no cabeçalho para receber solicitações.",
+                                color=COLORS["muted"],
+                                text_align="center",
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
                         width="100%",
                         height="100%",
                     ),
@@ -4516,13 +4829,27 @@ app = rx.App(
         window.sosProviderLocationMarkers = {};
 
         window.initSOSMap = function(id, center, zoom) {
-            if (window.sosMaps[id]) {
-                return window.sosMaps[id];
+            const container = document.getElementById(id);
+            if (!container) return null;
+
+            const existingMap = window.sosMaps[id];
+            if (existingMap) {
+                if (existingMap.getContainer() === container && container.isConnected) {
+                    requestAnimationFrame(() => existingMap.invalidateSize({ pan: false }));
+                    setTimeout(() => existingMap.invalidateSize({ pan: false }), 200);
+                    return existingMap;
+                }
+                existingMap.remove();
+                delete window.sosMaps[id];
+                delete window.sosMarkers[id];
+                delete window.sosUserMarkers[id];
+                delete window.sosProviderLocationMarkers[id];
             }
-            const map = L.map(id, { zoomControl: false }).setView(center, zoom);
+            const map = L.map(container, { zoomControl: false }).setView(center, zoom);
             L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "" }).addTo(map);
             window.sosMaps[id] = map;
-            setTimeout(() => map.invalidateSize(), 200);
+            requestAnimationFrame(() => map.invalidateSize({ pan: false }));
+            setTimeout(() => map.invalidateSize({ pan: false }), 200);
             return map;
         };
 

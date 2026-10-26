@@ -1,18 +1,13 @@
 import asyncio
 import unittest
-from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
-import requests
-
+from supabase_backend import SupabaseBackendError
 from sosdrive import (
     OperationalState,
-    XanoAPIError,
-    accept_service_request_xano,
     client_message_panel,
     customer_dashboard,
     provider_service_progress_screen,
-    release_service_request_xano,
     service_message_panel,
 )
 
@@ -25,39 +20,6 @@ def walk_components(component):
 
 
 class TestServiceChat(unittest.TestCase):
-    def test_xano_provider_guards_allow_only_the_assigned_provider(self):
-        xano_root = Path(__file__).resolve().parents[1] / "xano" / "api" / "service_requests"
-        accept_script = (xano_root / "accept" / "accept_POST.xs").read_text()
-        release_script = (xano_root / "update_request_status" / "update_request_status_POST.xs").read_text()
-        complete_script = (xano_root / "status" / "status_PATCH.xs").read_text()
-
-        self.assertIn(
-            'precondition ($authenticated_user.role == "prestador")',
-            accept_script,
-        )
-        assigned_provider_guard = (
-            'precondition ($existing_request.provider_id == $auth.id '
-            '&& $authenticated_user.role == "prestador")'
-        )
-        self.assertIn(assigned_provider_guard, release_script)
-        self.assertIn(assigned_provider_guard, complete_script)
-
-    def test_xano_acceptance_uses_unique_request_claim_before_assignment(self):
-        xano_root = Path(__file__).resolve().parents[1] / "xano"
-        acceptance_table = (xano_root / "table" / "service_request_acceptance.xs").read_text()
-        accept_script = (
-            xano_root / "api" / "service_requests" / "accept" / "accept_POST.xs"
-        ).read_text()
-
-        self.assertIn(
-            '{type: "btree|unique", field: [{name: "service_request_id"}]}',
-            acceptance_table,
-        )
-        self.assertLess(
-            accept_script.index("db.add service_request_acceptance"),
-            accept_script.index("db.edit service_request"),
-        )
-
     def make_state(self, *, provider_panel=False, client_panel=False, request_id=42):
         state = OperationalState.__new__(OperationalState)
         values = {
@@ -75,42 +37,6 @@ class TestServiceChat(unittest.TestCase):
             object.__setattr__(state, key, value)
         return state
 
-    def test_accept_request_uses_authenticated_accept_endpoint(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"id": 42, "status": "accepted", "provider_id": 7}
-
-        with patch("sosdrive.requests.post", return_value=response) as post:
-            result = accept_service_request_xano(
-                "provider-token",
-                "https://xano.example/api:services",
-                42,
-            )
-
-        self.assertEqual(result["provider_id"], 7)
-        post.assert_called_once_with(
-            "https://xano.example/api:services/42/accept",
-            headers={"Authorization": "Bearer provider-token"},
-            timeout=10,
-        )
-
-    def test_releasing_request_uses_only_the_pending_transition(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"id": 42, "status": "pending", "provider_id": None}
-
-        with patch("sosdrive.requests.post", return_value=response) as post:
-            release_service_request_xano(
-                "provider-token",
-                "https://xano.example/api:services",
-                42,
-            )
-
-        post.assert_called_once_with(
-            "https://xano.example/api:services/update_request_status",
-            json={"request_id": 42, "status": "pending"},
-            headers={"Authorization": "Bearer provider-token"},
-            timeout=10,
-        )
-
     def test_provider_conversation_refresh_replaces_messages_without_duplicates(self):
         state = self.make_state(provider_panel=True)
         refreshed = [
@@ -124,8 +50,7 @@ class TestServiceChat(unittest.TestCase):
                 "_get_auth_token",
                 new=AsyncMock(return_value="provider-token"),
             ),
-            patch("sosdrive.get_xano_services_url", return_value="https://xano.example/api:services"),
-            patch("sosdrive.fetch_service_messages_xano", return_value=refreshed) as fetch,
+            patch("sosdrive.fetch_service_messages_supabase", return_value=refreshed) as fetch,
         ):
             result = asyncio.run(state.refresh_open_service_messages(42))
 
@@ -133,7 +58,7 @@ class TestServiceChat(unittest.TestCase):
         self.assertEqual(state.service_messages, refreshed)
         self.assertEqual([message["id"] for message in state.service_messages], [1, 2])
         self.assertEqual(state.message_sync_status, "Atualização automática ativa.")
-        fetch.assert_called_once_with("provider-token", "https://xano.example/api:services", 42)
+        fetch.assert_called_once_with("provider-token", 42)
 
     def test_client_conversation_refreshes_its_active_request(self):
         state = self.make_state(provider_panel=False, client_panel=True)
@@ -144,9 +69,8 @@ class TestServiceChat(unittest.TestCase):
                 "_get_auth_token",
                 new=AsyncMock(return_value="client-token"),
             ),
-            patch("sosdrive.get_xano_services_url", return_value="https://xano.example/api:services"),
             patch(
-                "sosdrive.fetch_service_messages_xano",
+                "sosdrive.fetch_service_messages_supabase",
                 return_value=[{"id": 2, "message_text": "reply from provider"}],
             ) as fetch,
         ):
@@ -154,7 +78,7 @@ class TestServiceChat(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(state.service_messages[0]["message_text"], "reply from provider")
-        fetch.assert_called_once_with("client-token", "https://xano.example/api:services", 42)
+        fetch.assert_called_once_with("client-token", 42)
 
     def test_refresh_failure_preserves_messages_and_reports_retry(self):
         state = self.make_state(provider_panel=True)
@@ -166,25 +90,23 @@ class TestServiceChat(unittest.TestCase):
                 "_get_auth_token",
                 new=AsyncMock(return_value="provider-token"),
             ),
-            patch("sosdrive.get_xano_services_url", return_value="https://xano.example/api:services"),
             patch(
-                "sosdrive.fetch_service_messages_xano",
-                side_effect=requests.ConnectionError("private network detail"),
+                "sosdrive.fetch_service_messages_supabase",
+                side_effect=SupabaseBackendError(503),
             ),
-            self.assertLogs("sosdrive", level="ERROR") as captured,
+            self.assertLogs("sosdrive", level="ERROR"),
         ):
             result = asyncio.run(state.refresh_open_service_messages(42))
 
         self.assertFalse(result)
         self.assertEqual(state.service_messages, existing_messages)
         self.assertIn("Tentando novamente", state.message_sync_status)
-        self.assertNotIn("private network detail", "\n".join(captured.output))
 
     def test_closed_or_changed_conversation_is_not_refreshed(self):
         state = self.make_state(provider_panel=True)
         state.show_message_panel = False
 
-        with patch("sosdrive.fetch_service_messages_xano") as fetch:
+        with patch("sosdrive.fetch_service_messages_supabase") as fetch:
             result = asyncio.run(state.refresh_open_service_messages(42))
 
         self.assertFalse(result)
@@ -217,8 +139,7 @@ class TestServiceChat(unittest.TestCase):
                     "_get_auth_token",
                     new=AsyncMock(return_value="provider-token"),
                 ),
-                patch("sosdrive.get_xano_services_url", return_value="https://xano.example/api:services"),
-                patch("sosdrive.fetch_service_messages_xano", return_value=[]) as fetch,
+                patch("sosdrive.fetch_service_messages_supabase", return_value=[]) as fetch,
             ):
                 await OperationalState.poll_service_messages.fn(state)
             return fetch

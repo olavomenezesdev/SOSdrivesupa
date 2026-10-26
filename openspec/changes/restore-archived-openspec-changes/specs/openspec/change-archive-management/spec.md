@@ -1,20 +1,20 @@
 ## ADDED Requirements
 
 ### Requirement: Restore completed archived changes to the changes directory
-All completed OpenSpec change packages found under `openspec/archive/` MUST be
-restored under `openspec/changes/` with their names, artifacts, and contents
-preserved.
+All completed OpenSpec change packages found under
+`openspec/changes/archive/` MUST be restored under `openspec/changes/` with
+their names, artifacts, and contents preserved.
 
 #### Scenario: Completed archived changes exist
 - **GIVEN** one or more completed change packages exist under
-  `openspec/archive/`
+  `openspec/changes/archive/`
 - **WHEN** the restoration is performed
 - **THEN** every eligible package is present under `openspec/changes/`
 - **AND** its files and contents are preserved
 - **AND** no package is silently discarded or overwritten
 
 #### Scenario: No archive directory or no eligible packages exist
-- **GIVEN** `openspec/archive/` does not exist or contains no completed change
+- **GIVEN** `openspec/changes/archive/` does not exist or contains no completed change
   packages
 - **WHEN** the restoration is checked
 - **THEN** no package is moved
@@ -29,7 +29,7 @@ remain intact and be reported for explicit resolution.
 - **GIVEN** an archived package has unfinished tasks or cannot be confirmed as
   completed
 - **WHEN** the restoration is performed
-- **THEN** the package remains in `openspec/archive/`
+- **THEN** the package remains in `openspec/changes/archive/`
 - **AND** its path and reason are reported
 
 #### Scenario: Destination name already exists
@@ -39,19 +39,19 @@ remain intact and be reported for explicit resolution.
 - **AND** the conflict is reported for manual resolution
 
 ### Requirement: Remove an empty archive directory after restoration
-The system MUST remove `openspec/archive/` only when it is empty after all
+The system MUST remove `openspec/changes/archive/` only when it is empty after all
 eligible packages are restored.
 
 #### Scenario: All archived packages are restored
 - **GIVEN** every eligible package has been moved and no packages remain in the
   archive directory
 - **WHEN** the restoration completes
-- **THEN** the empty `openspec/archive/` directory is removed
+- **THEN** the empty `openspec/changes/archive/` directory is removed
 
 #### Scenario: Packages remain in the archive directory
 - **GIVEN** incomplete or conflicting packages remain
 - **WHEN** the restoration completes
-- **THEN** `openspec/archive/` remains intact
+- **THEN** `openspec/changes/archive/` remains intact
 
 ### Requirement: Keep completed changes in the active changes directory
 The project workflow MUST keep completed OpenSpec change packages under
@@ -63,4 +63,4 @@ The project workflow MUST keep completed OpenSpec change packages under
 - **WHEN** the project records the change as complete
 - **THEN** its package remains under `openspec/changes/`
 - **AND** the project workflow documentation instructs contributors not to
-  move it to `openspec/archive/`
+move it to `openspec/changes/archive/`

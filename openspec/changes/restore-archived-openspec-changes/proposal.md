@@ -2,18 +2,19 @@
 
 As mudanças do OpenSpec que já foram concluídas e arquivadas precisam continuar
 disponíveis em `openspec/changes/`, junto às demais mudanças do projeto. No
-estado atual do repositório não existe `openspec/archive/`, portanto não há
-pacotes arquivados para restaurar agora; a proposta registra o procedimento
-para restaurá-los caso estejam presentes no momento da aplicação.
+estado atual, os pacotes arquivados estão em
+`openspec/changes/archive/`. O inventário encontrou 13 pacotes: 10 com todas as
+tarefas concluídas, 2 sem confirmação de conclusão e 1 com tarefas pendentes.
+Não há colisões de nomes em `openspec/changes/`.
 
 ## O que muda
 
 - Restaurar para `openspec/changes/` cada pacote de mudança concluído encontrado
-  em `openspec/archive/`.
+  em `openspec/changes/archive/`.
 - Registrar no fluxo operacional do projeto que mudanças concluídas devem
   permanecer em `openspec/changes/`, sem serem arquivadas ao finalizar.
 - Preservar os arquivos e o conteúdo de cada pacote sem alterar seus artefatos.
-- Remover a pasta `openspec/archive/` somente quando estiver vazia após a
+- Remover a pasta `openspec/changes/archive/` somente quando estiver vazia após a
   restauração.
 - Interromper a restauração de qualquer pacote com conflito de nome ou conteúdo,
   sem sobrescrever nem descartar arquivos.
