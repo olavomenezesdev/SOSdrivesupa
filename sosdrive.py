@@ -954,9 +954,9 @@ class AuthState(rx.State):
 
     def redirect_to_user_profile(self):
         if self.user_role == "prestador":
-            return rx.redirect("/perfil-prestador")
+            return rx.redirect("/home_provider")
         if self.user_role == "cliente":
-            return rx.redirect("/perfil-cliente")
+            return rx.redirect("/home_client")
         raise UnsupportedRoleError()
 
     def restore_session(self):
@@ -1260,6 +1260,12 @@ class OperationalState(rx.State):
     @rx.var
     def has_available_requests(self) -> bool:
         return bool(self.available_requests)
+
+    @rx.var
+    def nearby_requests_summary(self) -> str:
+        count = len(self.available_requests)
+        noun = "chamado" if count == 1 else "chamados"
+        return f"{count} {noun} na sua região, do mais perto ao mais longe."
     show_client_message_panel: bool = False
 
 
@@ -1515,6 +1521,10 @@ class OperationalState(rx.State):
             "phone": format_phone(user_record.get("phone") or request_data.get("user_phone") or request_data.get("phone") or ""),
             "vehicle": vehicle_details or "Veículo não informado",
             "note": request_data.get("note") or "Sem observações.",
+            "description": request_data.get("description")
+            or request_data.get("address")
+            or request_data.get("note")
+            or "Cliente aguardando atendimento.",
             "distance": f"{dist_km:.1f} km",
             "eta": f"{int(dist_km * 3 + 5)} min", # Simple mock ETA based on distance
             "address": request_data.get("address") or "Endereço não informado",
@@ -1693,6 +1703,17 @@ class OperationalState(rx.State):
         """Remove a request from the provider's local queue."""
         self.available_requests = [item for item in self.available_requests if item["id"] != request_id]
         return rx.toast("Solicitação recusada.")
+
+    def view_request_details(self, request_id: int):
+        """Select a nearby request and open its details without accepting it."""
+        request = next(
+            (item for item in self.available_requests if item["id"] == request_id),
+            None,
+        )
+        if request is None:
+            return rx.toast("Solicitação não encontrada na lista local.")
+        self.selected_request = request
+        return rx.redirect("/service-details")
 
     def reset_provider_home(self):
         """Clear transient selection without changing provider availability."""
@@ -2380,19 +2401,33 @@ def vehicle_card(v: dict) -> rx.Component:
     """Card for displaying a single vehicle."""
     return rx.hstack(
         rx.hstack(
+            rx.box("▣", class_name="profile-vehicle-icon"),
             rx.vstack(
                 rx.text(f"{v['brand']} {v['model']}", weight="bold", size="3"),
-                rx.text(f"Placa: {v['plate']}", font_size="0.8rem", color=COLORS["text"]),
+                rx.text(
+                    f"{v['plate']} · {v.get('color', '')} · {v.get('year', '')}",
+                    font_size="0.8rem",
+                    color=COLORS["muted"],
+                ),
                 align="start",
                 spacing="1",
             ),
             width="100%",
             align="center",
-            padding="1rem",
-            background="white",
-            border_radius="12px",
-            border=f"1px solid {COLORS['line']}",
         ),
+        rx.button(
+            "Remover",
+            on_click=OperationalState.delete_vehicle(v["id"]),
+            class_name="profile-remove-button",
+            type="button",
+        ),
+        justify="between",
+        align="center",
+        padding=".75rem 1rem",
+        background="white",
+        border_radius="10px",
+        border=f"1px solid {COLORS['line']}",
+        width="100%",
     )
 
 
@@ -2497,12 +2532,19 @@ def brand_header() -> rx.Component:
     return rx.box(
         rx.hstack(
             rx.box("✦", class_name="brand-mark"),
-            rx.text("SOS drive", class_name="brand-name"),
-            spacing="3",
+            rx.text("SOS Drive", class_name="brand-name"),
+            spacing="2",
             align="center",
         ),
-        rx.text("assistência que chega até você", class_name="top-pill"),
-        justify="between",
+        rx.hstack(
+            rx.link("Como funciona", href="#como-funciona", class_name="landing-nav-link"),
+            rx.link("Serviços", href="#servicos", class_name="landing-nav-link"),
+            rx.link("Entrar", href="/login", class_name="landing-nav-link"),
+            rx.link("Criar conta", href="/signup", class_name="landing-call-button"),
+            spacing="5",
+            align="center",
+        ),
+        class_name="landing-nav",
         width="100%",
     )
 
@@ -2545,12 +2587,21 @@ def resend_confirmation_controls() -> rx.Component:
 
 
 def signup_screen() -> rx.Component:
-    return rx.center(
-        rx.vstack(
-            rx.text("comece por aqui", class_name="section-kicker"),
-            rx.heading("Crie sua conta.", class_name="section-title", size="8"),
-            rx.text("Escolha como você quer usar a SOS Drive.", class_name="section-intro"),
+    return rx.box(
+        rx.box(
             rx.hstack(
+                rx.box("✦", class_name="login-brand-mark"),
+                rx.text("SOS Drive", class_name="login-brand-name"),
+                spacing="2",
+                align="center",
+            ),
+            rx.vstack(
+                rx.heading("Crie sua conta", class_name="login-title", size="8"),
+                rx.text(
+                    "Escolha como você quer usar a SOS Drive.",
+                    class_name="login-subtitle",
+                ),
+                rx.hstack(
                 rx.button(
                     rx.vstack(
                         rx.text("Cliente / Motorista", weight="bold"),
@@ -2558,113 +2609,132 @@ def signup_screen() -> rx.Component:
                         spacing="1",
                         align="start",
                     ),
-                        on_click=AppState.choose_signup_role("cliente"),
+                    on_click=AppState.choose_signup_role("cliente"),
                     class_name=rx.cond(AppState.signup_role == "cliente", "role-card selected", "role-card"),
                     flex="1",
+                    type="button",
                 ),
-                rx.button(
-                    rx.vstack(
-                        rx.text("Prestador de serviço", weight="bold"),
-                        rx.text("Ofereço assistência", class_name="role-detail"),
-                        spacing="1",
-                        align="start",
-                    ),
-                    on_click=AppState.choose_signup_role("prestador"),
-                    class_name=rx.cond(AppState.signup_role == "prestador", "role-card selected", "role-card"),
-                    flex="1",
-                ),
-                width="100%",
-                spacing="3",
-            ),
-            rx.form(
-                rx.vstack(
-                    text_input("Nome", "Seu nome", AppState.signup_name, AppState.set_signup_name),
-                    text_input("Email", "voce@exemplo.com", AppState.signup_email, AppState.set_signup_email),
-                    rx.vstack(
-                        rx.text("Senha", class_name="field-label"),
-                        rx.input(
-                            type="password",
-                            placeholder="Crie uma senha",
-                            value=AppState.signup_password,
-                            on_change=AppState.set_signup_password,
-                            width="100%",
-                            height="3.25rem",
-                            padding="0 1rem",
-                            border_radius="14px",
-                            border=f"1px solid {COLORS['line']}",
-                            background="white",
-                            color=COLORS["text"],
-                        ),
-                        width="100%",
-                        spacing="2",
-                    ),
                     rx.button(
-                        rx.cond(AuthState.is_loading, "Criando conta...", "Criar conta"),
-                        type="submit",
-                        class_name="primary-button",
-                        width="100%",
-                        disabled=AuthState.is_loading,
-                    ),
-                    rx.cond(
-                        AppState.error_message != "",
-                        rx.text(AppState.error_message, class_name="error-message"),
-                    ),
-                    rx.cond(
-                        AppState.signup_message != "",
-                        rx.text(AppState.signup_message, class_name="success-message"),
+                        rx.vstack(
+                            rx.text("Prestador de serviço", weight="bold"),
+                            rx.text("Ofereço assistência", class_name="role-detail"),
+                            spacing="1",
+                            align="start",
+                        ),
+                        on_click=AppState.choose_signup_role("prestador"),
+                        class_name=rx.cond(AppState.signup_role == "prestador", "role-card selected", "role-card"),
+                        flex="1",
+                        type="button",
                     ),
                     width="100%",
-                    spacing="5",
+                    spacing="3",
+                    class_name="profile-fields-row",
                 ),
-                on_submit=AuthState.signup,
-                width="100%",
+                rx.form(
+                    rx.vstack(
+                        text_input("Nome", "Seu nome", AppState.signup_name, AppState.set_signup_name),
+                        text_input("E-mail", "voce@email.com", AppState.signup_email, AppState.set_signup_email),
+                        rx.vstack(
+                            rx.text("Senha", class_name="field-label"),
+                            rx.input(
+                                type="password",
+                                placeholder="Crie uma senha",
+                                value=AppState.signup_password,
+                                on_change=AppState.set_signup_password,
+                                width="100%",
+                                height="3.25rem",
+                                padding="0 1rem",
+                                border_radius="10px",
+                                border=f"1px solid {COLORS['line']}",
+                                background="white",
+                                color=COLORS["text"],
+                            ),
+                            width="100%",
+                            spacing="2",
+                        ),
+                        rx.button(
+                            rx.cond(AuthState.is_loading, "Criando conta...", "Criar conta"),
+                            type="submit",
+                            class_name="login-submit",
+                            width="100%",
+                            disabled=AuthState.is_loading,
+                        ),
+                        rx.cond(
+                            AppState.error_message != "",
+                            rx.text(AppState.error_message, class_name="error-message"),
+                        ),
+                        rx.cond(
+                            AppState.signup_message != "",
+                            rx.text(AppState.signup_message, class_name="success-message"),
+                        ),
+                        width="100%",
+                        spacing="4",
+                    ),
+                    on_submit=AuthState.signup,
+                    width="100%",
+                ),
+                resend_confirmation_controls(),
+                rx.hstack(
+                    rx.text("Já tem conta?", class_name="login-secondary-text"),
+                    rx.button("Entrar", on_click=AppState.open_login, class_name="login-inline-link", type="button"),
+                    rx.spacer(),
+                    rx.button(
+                        "Voltar para a apresentação",
+                        on_click=AppState.return_to_presentation,
+                        class_name="login-inline-link",
+                        type="button",
+                    ),
+                    width="100%",
+                    align="center",
+                ),
+                width="min(100%, 26rem)",
+                spacing="5",
+                class_name="login-form-content",
             ),
-            resend_confirmation_controls(),
-            rx.button(
-                "Já tenho uma conta",
-                on_click=AppState.open_login,
-                class_name="secondary-button",
-            ),
-            rx.button(
-                "Voltar para apresentação",
-                on_click=AppState.return_to_presentation,
-                class_name="text-button",
-            ),
-            width="min(100%, 38rem)",
-            align="start",
-            spacing="5",
-            class_name="login-panel",
+            class_name="login-form-panel",
         ),
-        min_height="calc(100vh - 8rem)",
-        padding="2rem 1rem",
+        rx.box(
+            rx.box(class_name="signup-map-lines"),
+            rx.box(class_name="signup-route"),
+            rx.box(class_name="signup-route-point"),
+            rx.vstack(
+                rx.heading("Mais perto de\nquem precisa.", class_name="login-visual-title", size="8"),
+                rx.text(
+                    "Motoristas pedem ajuda. Prestadores recebem chamados da própria região.",
+                    class_name="login-visual-copy",
+                ),
+                align="start",
+                spacing="3",
+                class_name="login-visual-copy-block",
+            ),
+            class_name="login-visual-panel signup-visual-panel",
+        ),
+        class_name="login-page",
     )
 
 
 def login_screen() -> rx.Component:
     return rx.box(
-        rx.el.video(
-            src=LOGIN_BACKGROUND_VIDEO_URL,
-            poster="/login-bg-fallback.svg",
-            auto_play=True,
-            loop=True,
-            muted=True,
-            plays_inline=True,
-            aria_hidden="true",
-            class_name="login-background-video",
-        ),
-        rx.box(class_name="login-background-overlay", aria_hidden="true"),
         rx.box(
+            rx.hstack(
+                rx.box("✦", class_name="login-brand-mark"),
+                rx.text("SOS Drive", class_name="login-brand-name"),
+                spacing="2",
+                align="center",
+            ),
             rx.vstack(
-                rx.text("acesso seguro", class_name="section-kicker"),
-                rx.heading("Entre para continuar.", class_name="section-title", size="8"),
-                rx.text("Use seu email e senha para acessar a SOS Drive.", class_name="section-intro"),
+                rx.heading("Entre para continuar", class_name="login-title", size="8"),
+                rx.text(
+                    "Use seu e-mail e senha para acessar a SOS Drive.",
+                    class_name="login-subtitle",
+                ),
                 rx.cond(
                     AppState.signup_message != "",
                     rx.text(AppState.signup_message, class_name="success-message"),
                 ),
                 rx.form(
                     rx.vstack(
-                        text_input("Email", "voce@exemplo.com", AppState.email, AppState.set_email_value),
+                        text_input("E-mail", "voce@email.com", AppState.email, AppState.set_email_value),
                         rx.vstack(
                             rx.text("Senha", class_name="field-label"),
                             rx.input(
@@ -2675,7 +2745,7 @@ def login_screen() -> rx.Component:
                                 width="100%",
                                 height="3.25rem",
                                 padding="0 1rem",
-                                border_radius="14px",
+                                border_radius="10px",
                                 border=f"1px solid {COLORS['line']}",
                                 background="white",
                                 color=COLORS["text"],
@@ -2686,7 +2756,7 @@ def login_screen() -> rx.Component:
                         rx.button(
                             rx.cond(AppState.is_loading, "Entrando...", "Entrar"),
                             type="submit",
-                            class_name="primary-button",
+                            class_name="login-submit",
                             width="100%",
                             disabled=AppState.is_loading,
                         ),
@@ -2696,27 +2766,57 @@ def login_screen() -> rx.Component:
                         ),
                         resend_confirmation_controls(),
                         width="100%",
-                        spacing="5",
+                        spacing="4",
                     ),
                     on_submit=AppState.login,
-                    width="min(100%, 29rem)",
+                    width="100%",
                 ),
-                rx.button(
-                    "Voltar para apresentação",
-                    on_click=AppState.return_to_presentation,
-                    class_name="secondary-button",
+                rx.hstack(
+                    rx.text("Não tem conta?", class_name="login-secondary-text"),
+                    rx.button(
+                        "Criar uma conta",
+                        on_click=AppState.open_signup,
+                        class_name="login-inline-link",
+                        type="button",
+                    ),
+                    rx.spacer(),
+                    rx.button(
+                        "Voltar para a apresentação",
+                        on_click=AppState.return_to_presentation,
+                        class_name="login-inline-link",
+                        type="button",
+                    ),
+                    width="100%",
+                    align="center",
                 ),
-                rx.button(
-                    "Criar uma conta",
-                    on_click=AppState.open_signup,
-                    class_name="text-button",
-                ),
-                width="min(100%, 38rem)",
-                align="start",
+                width="min(100%, 26rem)",
                 spacing="5",
-                class_name="login-panel login-background-card",
+                class_name="login-form-content",
             ),
-            class_name="login-content",
+            class_name="login-form-panel",
+        ),
+        rx.box(
+            rx.box(class_name="login-stars"),
+            rx.box(class_name="login-moon"),
+            rx.box(
+                rx.box(class_name="login-road-centerline"),
+                class_name="login-road",
+            ),
+            rx.vstack(
+                rx.heading(
+                    "Assistência\nquando o carro para.",
+                    class_name="login-visual-title",
+                    size="8",
+                ),
+                rx.text(
+                    "Peça ajuda, acompanhe o prestador e siga viagem com tranquilidade.",
+                    class_name="login-visual-copy",
+                ),
+                align="start",
+                spacing="3",
+                class_name="login-visual-copy-block",
+            ),
+            class_name="login-visual-panel",
         ),
         class_name="login-page",
     )
@@ -2767,95 +2867,119 @@ def hero_visual() -> rx.Component:
 
 def landing_page() -> rx.Component:
     steps = [
-        ("01", "Conte o que aconteceu", "Escolha o tipo de problema com poucos toques e sem formulários longos."),
-        ("02", "Encontre a melhor opção", "Veja profissionais disponíveis na região, com distância e estimativa de chegada."),
-        ("03", "Acompanhe com clareza", "Saiba o que acontece em cada etapa até o atendimento ser concluído."),
+        ("1", "Conte o que aconteceu", "Escolha o tipo de problema com poucos toques, sem formulários longos."),
+        ("2", "Escolha o prestador", "Veja quem está disponível na região, com distância e tempo de chegada."),
+        ("3", "Acompanhe até o fim", "Saiba o que acontece em cada etapa até o atendimento terminar."),
     ]
-    services = ["Pane mecânica", "Pneu furado", "Bateria", "Combustível", "Outro problema"]
+    services = [
+        ("◉", "Pane mecânica", "Diagnóstico no local"),
+        ("◉", "Pneu furado", "Troca rápida"),
+        ("◉", "Bateria", "Carga e troca"),
+        ("◉", "Combustível", "Entrega até você"),
+        ("◉", "Outro problema", "Descreva e envie"),
+    ]
     return rx.vstack(
-        rx.box(
-            brand_header(),
-            rx.text("quando imprevistos acontecem", class_name="eyebrow"),
-            rx.grid(
-                rx.vstack(
-                    rx.heading("Respire. A ajuda está chegando.", class_name="hero-title", size="9"),
-                    rx.text(
-                        "A SOS Drive encontra assistência confiável perto de você e transforma um momento difícil em um próximo passo simples.",
-                        class_name="hero-copy",
-                    ),
-                    rx.hstack(
-                        rx.text("◉ localização inteligente", class_name="trust-chip"),
-                        rx.text("✓ profissionais verificados", class_name="trust-chip"),
-                        rx.text("↗ acompanhamento claro", class_name="trust-chip"),
-                        wrap="wrap",
-                        spacing="3",
-                    ),
-                    rx.hstack(
-                        rx.link(
-                            "Conhecer a SOS Drive",
-                            href="/login",
-                            class_name="primary-button",
-                            flex="1",
-                            text_align="center",
-                            display="flex",
-                            align_items="center",
-                            justify_content="center",
-                            width="100%",
-                        ),
-                        rx.button("Ver mapa (Teste)", on_click=AppState.open_map_test, class_name="secondary-button", flex="1"),
-                        width="100%",
-                        spacing="3",
-                        margin_top="1rem",
-                    ),
-                    align="start",
-                    spacing="6",
+        brand_header(),
+        rx.grid(
+            rx.vstack(
+                rx.heading(
+                    "Respire. A ajuda está chegando.",
+                    class_name="hero-title",
+                    size="7",
                 ),
-                hero_visual(),
-                columns="2",
-                spacing="8",
+                rx.text(
+                    "A SOS Drive encontra assistência confiável perto de você "
+                    "e transforma um momento difícil em um próximo passo simples.",
+                    class_name="hero-copy",
+                ),
+                rx.hstack(
+                    rx.link(
+                        "Pedir ajuda agora",
+                        href="/login",
+                        class_name="primary-button action-button",
+                    ),
+                    rx.link(
+                        "Ver prestadores no mapa",
+                        href="/login",
+                        class_name="secondary-button action-button",
+                    ),
+                    spacing="3",
+                    width="100%",
+                ),
+                rx.hstack(
+                    rx.text("• Localização inteligente", class_name="landing-trust-item"),
+                    rx.text("• Profissionais verificados", class_name="landing-trust-item"),
+                    rx.text("• Acompanhamento ao vivo", class_name="landing-trust-item"),
+                    spacing="4",
+                    wrap="wrap",
+                ),
+                align="start",
+                spacing="5",
+            ),
+            hero_visual(),
+            columns="2",
+            spacing="6",
+            width="100%",
+            class_name="landing-hero-grid",
+        ),
+        rx.box(
+            rx.heading("Do problema à solução, sem labirinto.", class_name="section-title", size="5"),
+            rx.text("Em três passos você pede ajuda e acompanha tudo.", class_name="landing-section-copy"),
+            rx.grid(
+                *[
+                    rx.box(
+                        rx.text(number, class_name="landing-step-number"),
+                        rx.heading(title, size="2"),
+                        rx.text(copy, class_name="landing-card-copy"),
+                        class_name="landing-step",
+                    )
+                    for number, title, copy in steps
+                ],
+                columns="3",
+                spacing="6",
                 width="100%",
             ),
-            class_name="hero-shell",
-            width="100%",
-        ),
-
-        rx.text("uma jornada mais leve", class_name="section-kicker"),
-        rx.heading("Do problema à solução, sem labirinto.", class_name="section-title", size="8"),
-        rx.text(
-            "Em poucos passos, você entende as opções disponíveis, escolhe o tipo de ajuda e acompanha tudo com mais tranquilidade.",
-            class_name="section-intro",
-        ),
-        rx.grid(
-            *[
-                rx.box(
-                    rx.text(f"{number} · simples assim", class_name="step-number"),
-                    rx.heading(title, size="4"),
-                    rx.text(copy),
-                    class_name="info-card",
-                )
-                for number, title, copy in steps
-            ],
-            columns="3",
-            spacing="4",
-            width="100%",
-        ),
-        rx.text("assistência para o que você precisa", class_name="section-kicker"),
-        rx.heading("Quando o carro para, você continua.", class_name="section-title", size="8"),
-        rx.grid(
-            *[rx.box(rx.text(service), class_name="service-card") for service in services],
-            columns="5",
-            spacing="3",
+            id="como-funciona",
+            class_name="landing-section",
             width="100%",
         ),
         rx.box(
-            rx.heading("Feita para momentos em que clareza importa.", size="5"),
-            rx.text("24h · acesso quando precisar   |   1 lugar · para pedir e acompanhar   |   0 drama · menos etapas desnecessárias"),
-            class_name="trust-band",
+            rx.heading("Quando o carro para, você continua.", class_name="section-title", size="5"),
+            rx.text("Escolha o serviço de que precisa.", class_name="landing-section-copy"),
+            rx.grid(
+                *[
+                    rx.box(
+                        rx.text(icon, class_name="landing-service-icon"),
+                        rx.heading(title, size="2"),
+                        rx.text(copy, class_name="landing-card-copy"),
+                        class_name="landing-service",
+                    )
+                    for icon, title, copy in services
+                ],
+                columns="5",
+                spacing="3",
+                width="100%",
+            ),
+            id="servicos",
+            class_name="landing-section",
             width="100%",
         ),
-        rx.text("Uma porta de entrada, não um labirinto.", class_name="bottom-note"),
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Precisa de ajuda agora?", size="5"),
+                rx.text("Atendimento 24 horas, em um só lugar.", class_name="landing-footer-copy"),
+                align="start",
+                spacing="1",
+            ),
+            rx.link("Pedir ajuda", href="/login", class_name="landing-call-button"),
+            justify="between",
+            align="center",
+            class_name="landing-footer-cta",
+            width="100%",
+        ),
         spacing="7",
         width="100%",
+        class_name="landing-page-shell",
     )
 
 
@@ -3318,27 +3442,27 @@ def profile_screen() -> rx.Component:
             # Top Navigation / Back Button
             rx.hstack(
                 rx.button(
-                    rx.hstack(rx.text("←", font_size="1.2rem"), rx.text("Voltar")),
+                    rx.hstack(rx.text("←"), rx.text("Voltar")),
                     on_click=rx.cond(
                         AppState.user_role == "prestador",
                         rx.redirect("/home_provider"),
                         rx.redirect("/home_client"),
                     ),
-                    class_name="secondary-button",
+                    class_name="profile-back-button",
                     size="1",
                 ),
                 justify="start",
                 width="100%",
-                margin_bottom="2rem",
+                margin_bottom="1rem",
+                class_name="profile-topbar",
             ),
             # Header Section
             rx.vstack(
+                rx.heading("Seu perfil", class_name="profile-page-title", size="8"),
                 rx.text(
-                    rx.cond(AppState.user_role == "prestador", "perfil do prestador", "perfil do cliente"),
-                    class_name="section-kicker",
+                    "Quem atende seu chamado vê estas informações. Perfis completos agilizam o atendimento.",
+                    class_name="profile-page-subtitle",
                 ),
-                rx.heading("Mantenha seus dados em dia.", class_name="section-title", size="8"),
-                rx.text("Mantenha seus dados atualizados para melhor assistência.", class_name="section-intro"),
                 align="start",
                 spacing="2",
                 width="100%",
@@ -3386,13 +3510,32 @@ def profile_screen() -> rx.Component:
                         no_click=False,
                         class_name="profile-upload-dropzone",
                     ),
+                    rx.text(AppState.user_full_name, class_name="profile-summary-name"),
+                    rx.text(AppState.user_email, class_name="profile-summary-email"),
+                    rx.text("Perfil completo                         40%", class_name="profile-completion-label"),
+                    rx.box(
+                        rx.box(class_name="profile-completion-fill"),
+                        class_name="profile-completion-track",
+                    ),
+                    rx.vstack(
+                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Adicione uma foto"), spacing="2"),
+                        rx.hstack(rx.text("✓", class_name="profile-check done"), rx.text("Informe seu nome"), spacing="2"),
+                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Informe um CPF válido"), spacing="2"),
+                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Informe seu telefone"), spacing="2"),
+                        rx.hstack(rx.text("✓", class_name="profile-check done"), rx.text("Cadastre seu veículo"), spacing="2"),
+                        align="start",
+                        spacing="1",
+                        class_name="profile-checklist",
+                    ),
                     align="center",
                     spacing="3",
                     margin_bottom="2rem",
+                    class_name="profile-summary-card",
                 ),
                 # Basic Info
                 rx.vstack(
-                    rx.text("Informações Básicas", weight="bold", size="4", color=COLORS["navy"]),
+                    rx.text("Informações básicas", weight="bold", size="5", color=COLORS["navy"]),
+                    rx.text("Use os mesmos dados do seu documento.", class_name="profile-section-subtitle"),
                     rx.vstack(
                         rx.text("Nome", class_name="field-label"),
                         rx.input(
@@ -3409,31 +3552,52 @@ def profile_screen() -> rx.Component:
                         spacing="2",
                         align="start",
                     ),
-                    rx.vstack(
-                        rx.text("CPF", class_name="field-label"),
-                        rx.input(
-                            value=AppState.user_cpf,
-                            on_change=AppState.set_user_cpf,
-                            placeholder="000.000.000-00",
-                            class_name="profile-input",
+                    rx.hstack(
+                        rx.vstack(
+                            rx.text("CPF", class_name="field-label"),
+                            rx.input(
+                                value=AppState.user_cpf,
+                                on_change=AppState.set_user_cpf,
+                                placeholder="000.000.000-00",
+                                class_name="profile-input",
+                                width="100%",
+                                height="3.25rem",
+                                padding="0 1rem",
+                                border_radius="14px",
+                                border=f"1px solid {COLORS['line']}",
+                                background="#F1F5F9",
+                                color=COLORS["text"],
+                            ),
                             width="100%",
-                            height="3.25rem",
-                            padding="0 1rem",
-                            border_radius="14px",
-                            border=f"1px solid {COLORS['line']}",
-                            background="#F1F5F9",
-                            color=COLORS["text"],
+                            spacing="2",
+                            align="start",
+                        ),
+                        rx.vstack(
+                            rx.text("Telefone com DDD", class_name="field-label"),
+                            rx.input(
+                                value=AppState.user_phone,
+                                on_change=AppState.set_user_phone,
+                                placeholder="(11) 90000-0000",
+                                class_name="profile-input",
+                                width="100%",
+                                height="3.25rem",
+                                padding="0 1rem",
+                                border_radius="14px",
+                                border=f"1px solid {COLORS['line']}",
+                            ),
+                            width="100%",
+                            spacing="2",
+                            align="start",
                         ),
                         width="100%",
-                        spacing="2",
-                        align="start",
+                        spacing="3",
                     ),
                     rx.vstack(
                         rx.text("Email", class_name="field-label"),
                         rx.input(
                             value=AppState.user_email,
-                            on_change=AppState.set_user_email,
                             class_name="profile-input",
+                            disabled=True,
                             width="100%",
                             height="3.25rem",
                             padding="0 1rem",
@@ -3444,24 +3608,12 @@ def profile_screen() -> rx.Component:
                         spacing="2",
                         align="start",
                     ),
-                    rx.vstack(
-                        rx.text("Telefone", class_name="field-label"),
-                        rx.input(
-                            value=AppState.user_phone,
-                            on_change=AppState.set_user_phone,
-                            class_name="profile-input",
-                            width="100%",
-                            height="3.25rem",
-                            padding="0 1rem",
-                            border_radius="14px",
-                            border=f"1px solid {COLORS['line']}",
-                        ),
-                        width="100%",
-                        spacing="2",
-                        align="start",
+                    rx.text(
+                        "O e-mail é o seu login e não pode ser alterado aqui.",
+                        class_name="profile-email-help",
                     ),
                     spacing="3",
-                    class_name="op-card",
+                    class_name="profile-info-section",
                     width="100%",
                     align="start",
                 ),
@@ -3485,7 +3637,7 @@ def profile_screen() -> rx.Component:
                             width="100%",
                         ),
                         spacing="3",
-                        class_name="op-card",
+                        class_name="profile-info-section",
                         width="100%",
                         align="start",
                     ),
@@ -3501,7 +3653,7 @@ def profile_screen() -> rx.Component:
                         ),
                         rx.spacer(),
                         rx.button(
-                            "Adicionar",
+                            "Adicionar veículo",
                             on_click=OperationalState.open_new_vehicle_modal,
                             class_name="secondary-button",
                             size="1",
@@ -3521,16 +3673,19 @@ def profile_screen() -> rx.Component:
                         align="start",
                     ),
                     spacing="3",
-                    class_name="op-card",
+                    class_name="profile-vehicles-section",
                     width="100%",
                     align="start",
                 ),
-                rx.button(
-                    rx.cond(AppState.profile_is_loading, "Salvando...", "Salvar/Atualizar Dados"),
-                    on_click=AppState.save_profile,
-                    disabled=AppState.profile_is_loading,
-                    class_name="primary-button",
-                    width="100%",
+                rx.box(
+                    rx.text("Você tem alterações não salvas.", class_name="profile-unsaved-text"),
+                    rx.button(
+                        rx.cond(AppState.profile_is_loading, "Salvando...", "Salvar alterações"),
+                        on_click=AppState.save_profile,
+                        disabled=AppState.profile_is_loading,
+                        class_name="profile-save-button",
+                    ),
+                    class_name="profile-save-bar",
                 ),
                 rx.cond(
                     AppState.profile_error != "",
@@ -3541,15 +3696,16 @@ def profile_screen() -> rx.Component:
                     rx.text(AppState.profile_message, class_name="success-message"),
                 ),
                 width="100%",
-                max_width="600px",
                 spacing="5",
                 align="start",
+                class_name="profile-main-content",
             ),
             align="start",
             spacing="6",
-            padding="2rem 1rem",
+            padding="0 0 5rem",
             width="100%",
-            max_width="600px",
+            max_width="1050px",
+            class_name="profile-page-content",
         ),
         rx.cond(
             OperationalState.show_vehicle_modal,
@@ -3559,6 +3715,7 @@ def profile_screen() -> rx.Component:
         background=COLORS["background"],
         width="100%",
         min_height="100vh",
+        class_name="profile-page",
     )
 
 
@@ -3626,7 +3783,7 @@ def shortcut_card(icon: str, label: str, action) -> rx.Component:
 
 
 def user_home_screen() -> rx.Component:
-    """Repaginated home screen for the client focusing on hierarchy and contrast."""
+    """Render the client home with request controls beside the live map."""
     return rx.hstack(
         # LEFT SIDE: CONTROL PANEL
         rx.vstack(
@@ -3652,26 +3809,33 @@ def user_home_screen() -> rx.Component:
                 width="100%",
                 justify="between",
                 align="center",
-                margin_bottom="2rem",
+                margin_bottom="1.75rem",
+                class_name="client-home-header",
             ),
             # 2. Hero Section (Request Help)
             rx.cond(
                 AppState.active_call_status == None,
                 # State A: No active call
                 rx.button(
-                    rx.vstack(
-                        rx.text("🚨", font_size="3.5rem"),
-                        rx.text("Solicitar Socorro", color="white", weight="bold", font_weight="bold", font_size="1.6rem"),
+                    rx.hstack(
+                        rx.box("♧", class_name="client-help-icon"),
+                        rx.vstack(
+                            rx.text("Pedir socorro", color="white", weight="bold", font_size="1.55rem"),
+                            rx.text("Encontramos o prestador mais próximo de você.", color="white", font_size=".82rem"),
+                            align="start",
+                            spacing="1",
+                        ),
                         align="center",
-                        spacing="2",
+                        spacing="4",
                     ),
                     on_click=rx.redirect("/customer"),
-                    class_name="primary-button sos-request-button",
+                    class_name="client-help-button",
                     width="100%",
-                    height="14rem",
-                    border_radius="32px",
+                    height="7.6rem",
+                    border_radius="1.4rem",
                     color="white",
                     cursor="pointer",
+                    aria_label="Solicitar Socorro",
                 ),
                 # State B: Active call
                 rx.box(
@@ -3709,7 +3873,8 @@ def user_home_screen() -> rx.Component:
                 columns="3",
                 spacing="4",
                 width="100%",
-                margin_top="2rem",
+                margin_top="1rem",
+                class_name="client-shortcuts",
             ),
             # 4. Bottom Section (Location Context - status text only)
             rx.vstack(
@@ -3744,8 +3909,9 @@ def user_home_screen() -> rx.Component:
                 ),
                 align="start",
                 width="100%",
-                margin_top="3rem",
+                margin_top="auto",
                 spacing="2",
+                class_name="client-location-card",
             ),
             align="start",
             spacing="6",
@@ -3754,7 +3920,8 @@ def user_home_screen() -> rx.Component:
             height=["auto", "auto", "auto", "100%"],
             padding="2rem",
             background="white",
-            border_radius=["24px 24px 0 0", "24px 24px 0 0", "24px 24px 0 0", "24px"],
+            border_radius="0",
+            class_name="client-home-sidebar",
         ),
         # RIGHT SIDE: MAP AREA
         rx.box(
@@ -3771,6 +3938,7 @@ def user_home_screen() -> rx.Component:
             flex=["none", "none", "none", "1"],
             border_radius=["24px", "24px", "24px", "24px"],
             overflow="hidden",
+            class_name="client-home-map",
         ),
         width="100vw",
         height="100vh",
@@ -3784,70 +3952,71 @@ def user_home_screen() -> rx.Component:
     )
 
 def provider_home_screen() -> rx.Component:
-    """Central hub for the provider."""
+    """Provider home with the map and nearby service requests."""
     return rx.box(
         # Header
         rx.hstack(
             rx.hstack(
-                rx.vstack(
-                    rx.text("Área do prestador", weight="bold", color=COLORS["navy"]),
-                    rx.text(
-                        "Receba chamados quando estiver disponível",
-                        font_size="0.75rem",
-                        color=COLORS["muted"],
-                    ),
-                    align="start",
-                    spacing="1",
+                rx.box(
+                    rx.text("⚡", color="white", font_size="1.1rem"),
+                    class_name="provider-brand-mark",
                 ),
-                rx.button(
-                    rx.hstack(
-                        rx.box(
-                            width="0.65rem",
-                            height="0.65rem",
-                            border_radius="50%",
-                            background=rx.cond(OperationalState.is_available, "#16A34A", "#64748B"),
-                        ),
-                        rx.text(
-                            rx.cond(OperationalState.is_available, "Disponível", "Indisponível"),
-                            weight="bold",
-                            color=rx.cond(OperationalState.is_available, "#166534", "#475569"),
-                        ),
-                        spacing="2",
-                        align="center",
-                    ),
-                    on_click=OperationalState.toggle_provider_status,
-                    aria_label=rx.cond(
-                        OperationalState.is_available,
-                        "Disponível para chamados. Ative para ficar indisponível.",
-                        "Indisponível para chamados. Ative para ficar disponível.",
-                    ),
-                    background=rx.cond(OperationalState.is_available, "#F0FDF4", "#F1F5F9"),
-                    border=rx.cond(OperationalState.is_available, "1px solid #86EFAC", "1px solid #CBD5E1"),
-                    border_radius="999px",
-                    padding="0.65rem 0.9rem",
-                    cursor="pointer",
-                    flex_shrink="0",
-                ),
-                spacing="3",
+                rx.text("SOS Drive", weight="bold", color=COLORS["navy"], font_size="1.05rem"),
+                spacing="2",
                 align="center",
             ),
+            rx.vstack(
+                rx.text("Área do prestador", weight="bold", color=COLORS["navy"]),
+                rx.text(
+                    "Receba chamados quando estiver disponível",
+                    font_size="0.7rem",
+                    color=COLORS["muted"],
+                ),
+                align="start",
+                spacing="0",
+            ),
             rx.spacer(),
+            rx.button(
+                rx.hstack(
+                    rx.text(
+                        rx.cond(OperationalState.is_available, "Disponível", "Indisponível"),
+                        weight="bold",
+                        color=rx.cond(OperationalState.is_available, "#047857", "#475569"),
+                    ),
+                    rx.box(
+                        rx.box(
+                            class_name="provider-toggle-knob",
+                        ),
+                        class_name="provider-toggle-track",
+                    ),
+                    spacing="2",
+                    align="center",
+                ),
+                on_click=OperationalState.toggle_provider_status,
+                aria_label=rx.cond(
+                    OperationalState.is_available,
+                    "Disponível para chamados. Ative para ficar indisponível.",
+                    "Indisponível para chamados. Ative para ficar disponível.",
+                ),
+                class_name="provider-availability-toggle",
+                type="button",
+            ),
             profile_avatar(),
             position="fixed",
-            top=["0.75rem", "1rem", "1.25rem"],
-            left=["0.75rem", "1rem", "1.5rem"],
-            right=["0.75rem", "1rem", "1.5rem"],
+            top="0",
+            left="0",
+            right="0",
             z_index="3000",
             align="center",
-            padding="0.75rem 1rem",
-            background="rgba(255, 255, 255, 0.96)",
-            border=f"1px solid {COLORS['line']}",
-            border_radius="16px",
-            box_shadow="0 4px 18px rgba(15,23,42,0.12)",
+            padding="0.75rem 1.5rem",
+            background="white",
+            border_bottom=f"1px solid {COLORS['line']}",
+            box_shadow="0 1px 5px rgba(15,23,42,0.04)",
+            class_name="provider-home-header",
         ),
-        # Main Body (50/50 Split)
-        rx.vstack(
-            # Upper Half: Map
+        # Main Body
+        rx.hstack(
+            # Map
             rx.box(
                 rx.box(
                     id="provider-home-map",
@@ -3866,22 +4035,17 @@ def provider_home_screen() -> rx.Component:
                     ],
                 ),
                 rx.button(
-                    rx.hstack(rx.text("◎", font_size="1.25rem"), rx.text("Centralizar no meu local", size="2"), spacing="2", align="center"),
+                    "Centralizar no meu local",
                     on_click=rx.call_script(
                         "window.requestProviderMapLocation('provider-home-map');"
                     ),
                     aria_label="Centralizar o mapa na minha localização atual",
                     position="fixed",
-                    top=["7rem", "7rem", "7rem"],
-                    right=["0.75rem", "1rem", "1.5rem"],
+                    top="5rem",
+                    right="31.5%",
                     z_index="2000",
-                    background="white",
-                    color=COLORS["navy"],
-                    border=f"1px solid {COLORS['line']}",
-                    border_radius="999px",
-                    padding="0.65rem 0.9rem",
-                    box_shadow="0 3px 12px rgba(15,23,42,0.18)",
-                    cursor="pointer",
+                    class_name="provider-recenter-button",
+                    type="button",
                 ),
                 rx.text(
                     "",
@@ -3890,44 +4054,45 @@ def provider_home_screen() -> rx.Component:
                     aria_live="polite",
                     display="none",
                     position="absolute",
-                    left=["0.75rem", "1rem", "1.5rem"],
-                    bottom="1rem",
-                    z_index="500",
-                    max_width="min(80%, 28rem)",
-                    padding="0.5rem 0.75rem",
-                    background="rgba(255,255,255,0.96)",
-                    color=COLORS["text"],
-                    border_radius="10px",
-                    box_shadow="0 2px 10px rgba(15,23,42,0.14)",
-                    font_size="0.8rem",
                 ),
-                width="100%",
-                height="50vh",
+                width="70%",
+                height="100%",
                 position="relative",
                 overflow="hidden",
+                class_name="provider-map-pane",
             ),
-            # Lower Half: Requests List
+            # Requests panel
             rx.box(
-                rx.cond(
-                    OperationalState.is_available,
-                    rx.vstack(
-                        rx.text(
-                            "Solicitações Próximas",
-                            weight="bold",
-                            size="5",
-                            color=COLORS["navy"],
-                            margin_bottom="1rem",
-                        ),
-                        rx.vstack(
+                rx.vstack(
+                    rx.heading("Solicitações Próximas", size="6", color=COLORS["navy"]),
+                    rx.text(
+                        OperationalState.nearby_requests_summary,
+                        class_name="provider-requests-subtitle",
+                    ),
+                    rx.cond(
+                        OperationalState.is_available,
+                        rx.cond(
+                            OperationalState.pending_requests_loading
+                            & ~OperationalState.has_available_requests,
+                            rx.center(
+                                rx.vstack(
+                                    rx.spinner(),
+                                    rx.text("Carregando chamados próximos...", color=COLORS["muted"]),
+                                    align="center",
+                                    spacing="3",
+                                ),
+                                width="100%",
+                                min_height="12rem",
+                            ),
                             rx.cond(
-                                OperationalState.pending_requests_loading
-                                & ~OperationalState.has_available_requests,
+                                OperationalState.pending_requests_error != "",
                                 rx.center(
                                     rx.vstack(
-                                        rx.spinner(),
-                                        rx.text(
-                                            "Carregando chamados próximos...",
-                                            color=COLORS["muted"],
+                                        rx.text(OperationalState.pending_requests_error, color=COLORS["muted"]),
+                                        rx.button(
+                                            "Tentar novamente",
+                                            on_click=OperationalState.load_pending_requests,
+                                            class_name="secondary-button",
                                         ),
                                         align="center",
                                         spacing="3",
@@ -3936,115 +4101,94 @@ def provider_home_screen() -> rx.Component:
                                     min_height="12rem",
                                 ),
                                 rx.cond(
-                                    OperationalState.pending_requests_error != "",
+                                    OperationalState.has_available_requests,
+                                    rx.vstack(
+                                        rx.foreach(
+                                            OperationalState.available_requests,
+                                            lambda request: rx.vstack(
+                                                rx.hstack(
+                                                    rx.text(request["type"], weight="bold", color=COLORS["navy"]),
+                                                    rx.spacer(),
+                                                    rx.text(
+                                                        request["distance"],
+                                                        class_name="provider-request-distance",
+                                                    ),
+                                                    width="100%",
+                                                ),
+                                                rx.text(
+                                                    f"{request['vehicle']}. {request['description']}",
+                                                    class_name="provider-request-description",
+                                                ),
+                                                rx.cond(
+                                                    request["type"] == "Troca de Pneu",
+                                                    rx.button(
+                                                        "Aceitar chamado",
+                                                        on_click=lambda: OperationalState.accept_request(request["id"]),
+                                                        class_name="provider-request-action accept",
+                                                        type="button",
+                                                    ),
+                                                    rx.button(
+                                                        "Ver detalhes",
+                                                        on_click=lambda: OperationalState.view_request_details(request["id"]),
+                                                        class_name="provider-request-action details",
+                                                        type="button",
+                                                    ),
+                                                ),
+                                                width="100%",
+                                                spacing="2",
+                                                class_name="provider-request-card",
+                                            ),
+                                        ),
+                                        width="100%",
+                                        spacing="2",
+                                    ),
                                     rx.center(
                                         rx.vstack(
                                             rx.text(
-                                                OperationalState.pending_requests_error,
+                                                "Nenhum chamado ou cliente próximo no momento",
+                                                weight="bold",
+                                                color=COLORS["navy"],
+                                            ),
+                                            rx.text(
+                                                "Você receberá novas solicitações quando houver chamados na sua região.",
                                                 color=COLORS["muted"],
                                                 text_align="center",
                                             ),
-                                            rx.button(
-                                                "Tentar novamente",
-                                                on_click=OperationalState.load_pending_requests,
-                                                class_name="secondary-button",
-                                            ),
                                             align="center",
-                                            spacing="3",
+                                            spacing="2",
                                         ),
                                         width="100%",
                                         min_height="12rem",
                                     ),
-                                    rx.cond(
-                                        OperationalState.has_available_requests,
-                                        rx.vstack(
-                                            rx.foreach(
-                                                OperationalState.available_requests,
-                                                lambda r: rx.hstack(
-                                                    rx.box(
-                                                        rx.text(r["service_icon"], font_size="1.8rem"),
-                                                        width="3rem",
-                                                        height="3rem",
-                                                        display="flex",
-                                                        align_items="center",
-                                                        justify_content="center",
-                                                        background="#FFF7ED",
-                                                        border_radius="12px",
-                                                        flex_shrink="0",
-                                                    ),
-                                                    rx.vstack(
-                                                        rx.text(r["type"], weight="bold", color=COLORS["navy"]),
-                                                        rx.text(f"👤 {r['user']} • 📍 {r['distance']}", font_size="0.8rem", color=COLORS["text"]),
-                                                        align="start",
-                                                        spacing="1",
-                                                    ),
-                                                    rx.spacer(),
-                                                    rx.hstack(
-                                                        rx.button("Aceitar", on_click=lambda: OperationalState.accept_request(r["id"]), class_name="primary-button", size="1"),
-                                                        rx.button("Recusar", on_click=lambda: OperationalState.refuse_request(r["id"]), class_name="secondary-button", size="1"),
-                                                        spacing="2",
-                                                    ),
-                                                    width="100%",
-                                                    padding="1rem",
-                                                    background="white",
-                                                    border=f"1px solid {COLORS['line']}",
-                                                    border_radius="12px",
-                                                    box_shadow="0 4px 12px rgba(15,23,42,0.08)",
-                                                    spacing="3",
-                                                ),
-                                            ),
-                                            spacing="4",
-                                            width="100%",
-                                        ),
-                                        rx.center(
-                                            rx.vstack(
-                                                rx.text(
-                                                    "Nenhum chamado ou cliente próximo no momento",
-                                                    weight="bold",
-                                                    color=COLORS["navy"],
-                                                    text_align="center",
-                                                ),
-                                                rx.text(
-                                                    "Você receberá novas solicitações quando houver chamados na sua região.",
-                                                    color=COLORS["muted"],
-                                                    text_align="center",
-                                                ),
-                                                align="center",
-                                                spacing="2",
-                                            ),
-                                            width="100%",
-                                            min_height="12rem",
-                                        ),
-                                    ),
                                 ),
                             ),
-                            width="100%",
                         ),
-                    ),
-                    rx.center(
-                        rx.vstack(
-                            rx.text("Você está indisponível para novos chamados", weight="bold", color=COLORS["muted"]),
+                        rx.center(
                             rx.text(
-                                "Ative sua disponibilidade no cabeçalho para receber solicitações.",
+                                "Ative sua disponibilidade para receber solicitações.",
                                 color=COLORS["muted"],
                                 text_align="center",
                             ),
-                            align="center",
-                            spacing="2",
+                            width="100%",
+                            min_height="12rem",
                         ),
-                        width="100%",
-                        height="100%",
                     ),
+                    align="start",
+                    width="100%",
+                    spacing="1",
                 ),
-                width="100%",
-                height="50vh",
-                overflow_y="auto",
-                padding="1rem",
+                width="30%",
+                height="100%",
+                padding="1.25rem 1.5rem",
                 background="white",
+                overflow_y="auto",
+                class_name="provider-requests-pane",
             ),
             width="100%",
             height="100vh",
+            padding_top="4rem",
             spacing="0",
+            class_name="provider-home-body",
         ),
         on_mount=[
             OperationalState.reset_provider_home,
@@ -4053,6 +4197,7 @@ def provider_home_screen() -> rx.Component:
         background="white",
         width="100%",
         min_height="100vh",
+        class_name="provider-home-page",
     )
 
 

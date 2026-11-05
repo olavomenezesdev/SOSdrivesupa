@@ -5,7 +5,7 @@ O login atual autentica o usuário, mas ainda não transforma a role retornada p
 ## What Changes
 
 - Garantir que `user.role` aceite exclusivamente `prestador` ou `cliente` e que o login retorne essa informação junto do token.
-- Redirecionar usuários autenticados para `/perfil-prestador` ou `/perfil-cliente` conforme a role validada no backend.
+- Redirecionar usuários autenticados para `/home_provider` ou `/home_client` conforme a role validada no backend, mantendo as rotas de perfil para edição cadastral.
 - Criar uma página de perfil com upload/URL de foto, nome completo, CPF, telefone e ação laranja de salvar/atualizar.
 - Criar a tabela relacional `user_profile`, vinculada a `user` por `user_id`, e seus endpoints autenticados de leitura e gravação.
 - Aplicar o padrão visual existente: fundo off-white, títulos azul-marinho, ações laranja, estados de foco azul-marinho e alertas vermelhos.

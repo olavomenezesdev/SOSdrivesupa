@@ -4,18 +4,18 @@ Esta capacidade direciona cada conta autenticada para sua jornada de cliente ou 
 
 ## ADDED Requirements
 
-### Requirement: The authenticated role selects the user profile route
-The system MUST accept only the roles `cliente` and `prestador` for this flow, expose the role in the authenticated user payload, and route the user to the matching profile route after a successful login.
+### Requirement: The authenticated role selects the user home route
+The system MUST accept only the roles `cliente` and `prestador` for this flow, expose the role in the authenticated user payload, and route the user to the matching home route after a successful login.
 
-#### Scenario: Client login is redirected to the client profile
+#### Scenario: Client login is redirected to the client home
 - **GIVEN** Xano authenticates a user whose role is `cliente`
 - **WHEN** the login completes successfully
-- **THEN** the application stores the authenticated session and navigates to `/perfil-cliente`
+- **THEN** the application stores the authenticated session and navigates to `/home_client`
 
-#### Scenario: Provider login is redirected to the provider profile
+#### Scenario: Provider login is redirected to the provider home
 - **GIVEN** Xano authenticates a user whose role is `prestador`
 - **WHEN** the login completes successfully
-- **THEN** the application stores the authenticated session and navigates to `/perfil-prestador`
+- **THEN** the application stores the authenticated session and navigates to `/home_provider`
 
 #### Scenario: Unsupported role is rejected
 - **GIVEN** the authenticated user has a role other than `cliente` or `prestador`

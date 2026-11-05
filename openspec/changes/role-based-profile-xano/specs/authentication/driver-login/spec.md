@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
-### Requirement: The login screen authenticates through Xano and routes by role
-The system MUST send the submitted email and password to the configured Xano `POST auth/login` endpoint, retain the returned authentication session, obtain the authenticated user's role, and route only supported roles to their corresponding profile route.
+### Requirement: The login screen authenticates through Supabase and routes by role
+The system MUST send the submitted email and password to the configured authentication endpoint, retain the returned authentication session, obtain the authenticated user's role, and route only supported roles to their corresponding home route.
 
 #### Scenario: Successful client authentication
 - **GIVEN** a configured Xano API base URL and valid credentials for a user with role `cliente`
@@ -9,19 +9,19 @@ The system MUST send the submitted email and password to the configured Xano `PO
 - **THEN** the application sends a JSON request containing `email` and `password` to `<XANO_API_URL>/auth/login`
 - **AND** it stores the returned `authToken` and user identifier in current server-side session state
 - **AND** it obtains the authenticated role
-- **AND** it redirects the user to `/perfil-cliente`
+- **AND** it redirects the user to `/home_client`
 - **AND** it does not persist the submitted password
 
 #### Scenario: Successful provider authentication
 - **GIVEN** a configured Xano API base URL and valid credentials for a user with role `prestador`
 - **WHEN** the user submits the login form
-- **THEN** the application redirects the user to `/perfil-prestador`
+- **THEN** the application redirects the user to `/home_provider`
 - **AND** it does not expose the authentication token in the rendered page
 
 #### Scenario: Unsupported authenticated role
 - **GIVEN** Xano returns a role other than `cliente` or `prestador`
 - **WHEN** authentication completes
-- **THEN** the application does not redirect to a profile route
+- **THEN** the application does not redirect to a home route
 - **AND** it shows a recoverable authorization error
 
 #### Scenario: Invalid credentials

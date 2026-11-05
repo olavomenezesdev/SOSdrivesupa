@@ -73,8 +73,8 @@ class TestSupabaseLogin(unittest.TestCase):
 
     def test_login_routes_client_and_provider_and_keeps_tokens_in_server_state(self):
         for role, expected_route in (
-            ("cliente", "/perfil-cliente"),
-            ("prestador", "/perfil-prestador"),
+            ("cliente", "/home_client"),
+            ("prestador", "/home_provider"),
         ):
             with self.subTest(role=role):
                 state = make_auth_state()

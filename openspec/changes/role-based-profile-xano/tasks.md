@@ -13,7 +13,7 @@
 
 ## 3. Integração Reflex e roteamento
 
-- [x] 3.1 Reutilizar `AuthState` e o cliente Xano existente em `sosdrive.py` para carregar a role de `auth/me` antes do redirecionamento, verificando as rotas `/perfil-cliente` e `/perfil-prestador`
+- [x] 3.1 Reutilizar `AuthState` e o cliente de autenticação existente em `sosdrive.py` para carregar a role antes do redirecionamento, verificando as rotas `/home_client` e `/home_provider`; manter as rotas de perfil para edição cadastral
 - [x] 3.2 Tratar role ausente ou inválida, sessão expirada e falhas de API com mensagens recuperáveis, limpar a senha após submit e verificar que token e senha não aparecem na UI
 - [x] 3.3 Implementar um componente de formulário compartilhado para os dois perfis, reutilizando tokens de `styles.py` e verificando o layout responsivo em desktop e mobile
 - [x] 3.4 Adicionar upload/URL opcional de foto, campos de nome completo, CPF e telefone com máscaras de exibição e valores normalizados enviados ao Xano; verificar edição, limpeza e carregamento de perfil vazio
