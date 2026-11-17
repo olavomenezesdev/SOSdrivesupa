@@ -292,6 +292,19 @@ GLOBAL_STYLE = {
         "pointer_events": "none",
     },
     ".field-label": {"color": COLORS["navy"], "font_size": ".85rem", "font_weight": "800"},
+    ".login-page input, .login-page textarea, .login-page select": {
+        "color": "#000000 !important",
+    },
+    ".login-page input::placeholder, .login-page textarea::placeholder": {
+        "color": "#000000 !important",
+        "opacity": "1",
+    },
+    ".login-page input:-webkit-autofill, .login-page textarea:-webkit-autofill, .login-page select:-webkit-autofill": {
+        "-webkit-text-fill-color": "#000000 !important",
+    },
+    ".login-page select option": {
+        "color": "#000000 !important",
+    },
     ".profile-input": {
         "border": "1px solid transparent",
         "background": "#F1F5F9",
