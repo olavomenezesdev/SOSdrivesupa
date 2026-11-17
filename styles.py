@@ -293,23 +293,151 @@ GLOBAL_STYLE = {
     },
     ".field-label": {"color": COLORS["navy"], "font_size": ".85rem", "font_weight": "800"},
     ".login-page input, .login-page textarea, .login-page select": {
-        "color": "#000000 !important",
+        "color": "rgba(0, 0, 0, 0.5) !important",
     },
     ".login-page input::placeholder, .login-page textarea::placeholder": {
-        "color": "#000000 !important",
+        "color": "rgba(0, 0, 0, 0.5) !important",
         "opacity": "1",
     },
     ".login-page input:-webkit-autofill, .login-page textarea:-webkit-autofill, .login-page select:-webkit-autofill": {
-        "-webkit-text-fill-color": "#000000 !important",
+        "-webkit-text-fill-color": "rgba(0, 0, 0, 0.5) !important",
     },
     ".login-page select option": {
-        "color": "#000000 !important",
+        "color": "rgba(0, 0, 0, 0.5) !important",
     },
     ".profile-input": {
         "border": "1px solid transparent",
         "background": "#F1F5F9",
         "color": COLORS["text"],
         "_focus": {"border_color": COLORS["navy"], "outline": "none"},
+    },
+    ".vehicle-modal-overlay": {
+        "position": "fixed",
+        "inset": "0",
+        "z_index": "1000",
+        "display": "flex",
+        "align_items": "center",
+        "justify_content": "center",
+        "padding": "1rem",
+        "background": "rgba(0, 0, 0, 0.5)",
+        "backdrop_filter": "blur(4px)",
+    },
+    ".vehicle-modal-card": {
+        "width": "min(100%, 48rem)",
+        "max_height": "calc(100vh - 2rem)",
+        "overflow_y": "auto",
+        "padding": "2.5rem",
+        "background": "#FFFFFF",
+        "border_radius": "24px",
+        "box_shadow": "0 20px 50px rgba(16, 26, 48, 0.2)",
+    },
+    ".vehicle-modal-card-content": {
+        "width": "100%",
+        "gap": "1.5rem",
+    },
+    ".vehicle-modal-header": {
+        "width": "100%",
+    },
+    ".vehicle-modal-icon": {
+        "display": "grid",
+        "place_items": "center",
+        "flex_shrink": "0",
+        "width": "5rem",
+        "height": "5rem",
+        "border_radius": "50%",
+        "background": "#EEF4FC",
+        "color": "#101A30",
+    },
+    ".vehicle-modal-title": {
+        "margin": "0",
+        "color": "#101A30",
+        "font_size": "2rem",
+        "font_weight": "800",
+    },
+    ".vehicle-modal-divider": {
+        "width": "100%",
+        "height": "1px",
+        "background": "#D7E2F0",
+    },
+    ".vehicle-modal-form": {
+        "width": "100%",
+        "gap": "1.25rem",
+    },
+    ".vehicle-modal-field": {
+        "width": "100%",
+        "gap": ".5rem",
+    },
+    ".vehicle-modal-label": {
+        "color": "#101A30",
+        "font_size": "1rem",
+        "font_weight": "800",
+    },
+    ".vehicle-modal-input": {
+        "width": "100%",
+        "height": "4rem",
+        "padding": "0 1rem",
+        "border": "1px solid #D7E2F0",
+        "border_radius": "16px",
+        "background": "#FFFFFF",
+        "color": "rgba(0, 0, 0, 0.5)",
+        "font_size": "1.05rem",
+        "_focus": {
+            "border_color": "#101A30",
+            "outline": "none",
+            "box_shadow": "0 0 0 3px rgba(16, 26, 48, 0.08)",
+        },
+    },
+    ".vehicle-modal-input::placeholder": {
+        "color": "rgba(0, 0, 0, 0.5)",
+        "opacity": "1",
+    },
+    ".vehicle-modal-input:-webkit-autofill": {
+        "-webkit-text-fill-color": "rgba(0, 0, 0, 0.5) !important",
+    },
+    ".vehicle-modal-card select option": {
+        "color": "rgba(0, 0, 0, 0.5)",
+    },
+    ".vehicle-modal-split": {
+        "display": "grid",
+        "grid_template_columns": "repeat(2, minmax(0, 1fr))",
+        "gap": "1.5rem",
+        "width": "100%",
+    },
+    ".vehicle-modal-actions": {
+        "display": "flex",
+        "gap": "1.25rem",
+        "width": "100%",
+    },
+    ".vehicle-modal-cancel, .vehicle-modal-save": {
+        "flex": "1",
+        "min_height": "4.25rem",
+        "border_radius": "16px",
+        "font_size": "1.1rem",
+        "font_weight": "800",
+    },
+    ".vehicle-modal-cancel": {
+        "border": "2px solid #101A30",
+        "background": "#FFFFFF",
+        "color": "#101A30",
+    },
+    ".vehicle-modal-save": {
+        "background": "#FF7015",
+        "color": "#FFFFFF",
+        "box_shadow": "0 8px 18px rgba(255, 112, 21, 0.22)",
+    },
+    "@media (max-width: 640px)": {
+        ".vehicle-modal-card": {
+            "padding": "1.5rem",
+        },
+        ".vehicle-modal-split": {
+            "grid_template_columns": "1fr",
+        },
+        ".vehicle-modal-title": {
+            "font_size": "1.6rem",
+        },
+        ".vehicle-modal-actions": {
+            "flex_direction": "column",
+        },
     },
     ".error-message": {"color": "#B91C1C", "font_size": ".9rem", "font_weight": "700"},
     ".success-message": {"color": "#166534", "font_size": ".9rem", "font_weight": "700"},

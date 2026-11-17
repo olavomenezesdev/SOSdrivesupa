@@ -1293,7 +1293,7 @@ class OperationalState(rx.State):
     v_brand: str = ""
     v_model: str = ""
     v_plate: str = ""
-    v_year: int = 2024
+    v_year: str = ""
     v_color: str = ""
 
     async def _get_auth_token(self) -> str:
@@ -1349,10 +1349,7 @@ class OperationalState(rx.State):
         self.v_plate = v
 
     def set_v_year(self, v: str):
-        try:
-            self.v_year = int(v)
-        except ValueError:
-            pass
+        self.v_year = "".join(char for char in v if char in "0123456789")[:4]
 
     def set_v_color(self, v: str):
         self.v_color = v
@@ -1382,13 +1379,15 @@ class OperationalState(rx.State):
                 self.v_brand = v["brand"]
                 self.v_model = v["model"]
                 self.v_plate = v["plate"]
-                self.v_year = v["year"]
+                self.v_year = "".join(
+                    char for char in str(v.get("year", "")) if char in "0123456789"
+                )[:4]
                 self.v_color = v["color"]
         else:
             self.v_brand = ""
             self.v_model = ""
             self.v_plate = ""
-            self.v_year = 2024
+            self.v_year = ""
             self.v_color = ""
 
     def open_new_vehicle_modal(self):
@@ -2438,92 +2437,97 @@ def vehicle_modal() -> rx.Component:
         rx.box(
             rx.box(
                 rx.vstack(
-                    rx.heading(
-                        rx.cond(OperationalState.editing_vehicle_id, "Editar Veículo", "Adicionar Veículo"),
-                        size="5",
-                        margin_bottom="1rem",
-                    ),
-                    rx.vstack(
-                        rx.text("Marca", class_name="field-label"),
-                        rx.input(
-                            value=OperationalState.v_brand,
-                            on_change=OperationalState.set_v_brand,
-                            width="100%",
-                            border_radius="12px",
-                        ),
-                        width="100%",
-                    ),
-                    rx.vstack(
-                        rx.text("Modelo", class_name="field-label"),
-                        rx.input(
-                            value=OperationalState.v_model,
-                            on_change=OperationalState.set_v_model,
-                            width="100%",
-                            border_radius="12px",
-                        ),
-                        width="100%",
-                    ),
-                    rx.vstack(
-                        rx.text("Placa", class_name="field-label"),
-                        rx.input(
-                            value=OperationalState.v_plate,
-                            on_change=OperationalState.set_v_plate,
-                            width="100%",
-                            border_radius="12px",
-                        ),
-                        width="100%",
-                    ),
                     rx.hstack(
+                        rx.box(
+                            rx.icon("car-front", size=40),
+                            class_name="vehicle-modal-icon",
+                        ),
+                        rx.heading(
+                            rx.cond(OperationalState.editing_vehicle_id, "Editar Veículo", "Adicionar Veículo"),
+                            class_name="vehicle-modal-title",
+                        ),
+                        align="center",
+                        spacing="4",
+                        class_name="vehicle-modal-header",
+                    ),
+                    rx.box(class_name="vehicle-modal-divider"),
+                    rx.vstack(
                         rx.vstack(
-                            rx.text("Ano", class_name="field-label"),
+                            rx.text("Marca", class_name="vehicle-modal-label"),
                             rx.input(
-                                value=str(OperationalState.v_year),
-                                on_change=OperationalState.set_v_year,
-                                width="100%",
-                                border_radius="12px",
+                                value=OperationalState.v_brand,
+                                placeholder="Digite a marca do veículo",
+                                on_change=OperationalState.set_v_brand,
+                                class_name="vehicle-modal-input",
                             ),
-                            width="50%",
+                            class_name="vehicle-modal-field",
                         ),
                         rx.vstack(
-                            rx.text("Cor", class_name="field-label"),
+                            rx.text("Modelo", class_name="vehicle-modal-label"),
                             rx.input(
-                                value=OperationalState.v_color,
-                                on_change=OperationalState.set_v_color,
-                                width="100%",
-                                border_radius="12px",
+                                value=OperationalState.v_model,
+                                placeholder="Digite o modelo do veículo",
+                                on_change=OperationalState.set_v_model,
+                                class_name="vehicle-modal-input",
                             ),
-                            width="50%",
+                            class_name="vehicle-modal-field",
                         ),
-                        spacing="3",
-                        width="100%",
+                        rx.vstack(
+                            rx.text("Placa", class_name="vehicle-modal-label"),
+                            rx.input(
+                                value=OperationalState.v_plate,
+                                placeholder="Digite a placa do veículo",
+                                on_change=OperationalState.set_v_plate,
+                                class_name="vehicle-modal-input",
+                            ),
+                            class_name="vehicle-modal-field",
+                        ),
+                        rx.grid(
+                            rx.vstack(
+                                rx.text("Ano", class_name="vehicle-modal-label"),
+                                rx.input(
+                                    value=OperationalState.v_year,
+                                    placeholder="AAAA",
+                                    on_change=OperationalState.set_v_year,
+                                    max_length=4,
+                                    input_mode="numeric",
+                                    class_name="vehicle-modal-input",
+                                ),
+                                class_name="vehicle-modal-field",
+                            ),
+                            rx.vstack(
+                                rx.text("Cor", class_name="vehicle-modal-label"),
+                                rx.input(
+                                    value=OperationalState.v_color,
+                                    placeholder="Digite a cor do veículo",
+                                    on_change=OperationalState.set_v_color,
+                                    class_name="vehicle-modal-input",
+                                ),
+                                class_name="vehicle-modal-field",
+                            ),
+                            class_name="vehicle-modal-split",
+                        ),
+                        class_name="vehicle-modal-form",
                     ),
+                    rx.box(class_name="vehicle-modal-divider"),
                     rx.hstack(
-                        rx.button("Cancelar", on_click=OperationalState.close_vehicle_modal, class_name="secondary-button", width="100%"),
-                        rx.button("Salvar", on_click=OperationalState.save_vehicle, class_name="primary-button", width="100%"),
-                        spacing="3",
-                        width="100%",
-                        margin_top="1rem",
+                        rx.button(
+                            "Cancelar",
+                            on_click=OperationalState.close_vehicle_modal,
+                            class_name="vehicle-modal-cancel",
+                        ),
+                        rx.button(
+                            "Salvar",
+                            on_click=OperationalState.save_vehicle,
+                            class_name="vehicle-modal-save",
+                        ),
+                        class_name="vehicle-modal-actions",
                     ),
-                    spacing="4",
-                    width="100%",
+                    class_name="vehicle-modal-card-content",
                 ),
-                padding="2rem",
-                background="white",
-                border_radius="24px",
-                width="min(100%, 24rem)",
-                box_shadow="0 20px 50px rgba(0,0,0,0.2)",
+                class_name="vehicle-modal-card",
             ),
-            position="fixed",
-            top="0",
-            left="0",
-            right="0",
-                bottom="0",
-            z_index="1000",
-            background="rgba(0,0,0,0.5)",
-            backdrop_filter="blur(4px)",
-            display="flex",
-            align_items="center",
-            justify_content="center",
+            class_name="vehicle-modal-overlay",
         ),
     )
 
