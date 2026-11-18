@@ -1,0 +1,23 @@
+*.db
+.states
+assets/external/
+.web
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+
+# Local editor and tool state
+.vscode/settings.json
+.claude/
+.gemini/
+
+# Local OS files
+.DS_Store
+Thumbs.db
