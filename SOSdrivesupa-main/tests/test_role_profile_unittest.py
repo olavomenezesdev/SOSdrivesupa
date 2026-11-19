@@ -12,7 +12,6 @@ from sosdrive import (
     format_cpf,
     format_phone,
     normalize_user_role,
-    pending_provider_requests,
     save_user_profile,
     upload_user_profile_photo,
     validate_signup,
@@ -84,6 +83,7 @@ class TestRoleProfile(unittest.TestCase):
         object.__setattr__(state, "user_vehicles", [{"id": 1, "brand": "Toyota", "model": "Corolla", "plate": "ABC-1234"}])
         object.__setattr__(state, "selected_vehicle_id", 1)
         object.__setattr__(state, "client_location", {"lat": -23.55, "lng": -46.63})
+        object.__setattr__(state, "client_location_received", True)
         object.__setattr__(state, "selected_service", None)
         object.__setattr__(state, "request_status", "idle")
         object.__setattr__(state, "request_id", None)
@@ -94,18 +94,57 @@ class TestRoleProfile(unittest.TestCase):
         object.__setattr__(state, "show_profile_link", False)
         object.__setattr__(state, "pending_service_type", "")
 
-        original_queue = pending_provider_requests[:]
-        pending_provider_requests.clear()
-        try:
-            object.__setattr__(state, "_get_auth_token", AsyncMock(return_value="token-123"))
-            with patch("sosdrive.create_service_request_supabase", return_value={"request_id": 99, "status": "pending", "estimated_price": 150.0, "distance_km": 4.4}):
-                asyncio.run(state._submit_customer_request("tire"))
+        object.__setattr__(state, "_get_auth_token", AsyncMock(return_value="token-123"))
+        with patch(
+            "sosdrive.create_service_request_supabase",
+            return_value={
+                "request_id": 99,
+                "status": "pending",
+                "estimated_price": 150.0,
+                "distance_km": 4.4,
+            },
+        ) as create_request:
+            asyncio.run(state._submit_customer_request("tire"))
 
-            self.assertEqual(state.request_status, "searching")
-            self.assertEqual(state.request_id, 99)
-            self.assertEqual(pending_provider_requests, [])
-        finally:
-            pending_provider_requests[:] = original_queue
+        create_request.assert_called_once_with(
+            "token-123",
+            "tire",
+            1,
+            -23.55,
+            -46.63,
+        )
+        self.assertEqual(state.request_status, "searching")
+        self.assertEqual(state.request_id, 99)
+
+    def test_customer_request_accepts_zero_coordinates_when_geolocation_is_set(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "user_vehicles": [{"id": 1}],
+            "selected_vehicle_id": 1,
+            "client_location": {"lat": 0.0, "lng": 0.0},
+            "client_location_received": True,
+            "request_status": "idle",
+            "request_error_message": "",
+            "show_profile_link": False,
+            "selected_service": None,
+            "request_id": None,
+            "request_server_status": "",
+            "request_estimated_price": 0.0,
+            "request_distance_km": 0.0,
+        }.items():
+            object.__setattr__(state, name, value)
+        object.__setattr__(state, "_get_auth_token", AsyncMock(return_value="token-123"))
+
+        with patch(
+            "sosdrive.create_service_request_supabase",
+            return_value={"request_id": 101, "status": "pending"},
+        ) as create_request:
+            asyncio.run(state._submit_customer_request("battery"))
+
+        create_request.assert_called_once_with("token-123", "battery", 1, 0.0, 0.0)
+        self.assertEqual(state.request_status, "searching")
+        self.assertEqual(state.request_id, 101)
 
     def test_save_user_profile_sends_only_profile_fields(self):
         response = Mock(status_code=200)

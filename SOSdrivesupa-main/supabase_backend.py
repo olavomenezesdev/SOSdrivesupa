@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -36,6 +38,9 @@ class SupabaseAuthenticationError(SupabaseBackendError):
 
 class SupabaseConfigurationRuntimeError(SupabaseBackendError):
     """Supabase runtime settings are missing or invalid."""
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -495,7 +500,45 @@ def fetch_pending_requests(access_token: str) -> list[dict[str, Any]]:
     client = _authenticated_client(access_token)
     try:
         result = client.rpc("list_pending_service_requests", {}).execute().data
-        return result if isinstance(result, list) else []
+        if not isinstance(result, list):
+            raise SupabaseBackendError(
+                502,
+                "Supabase returned an invalid pending request list",
+            )
+        logger.info("Pending service request RPC returned count=%s", len(result))
+        return result
+    except SupabaseBackendError:
+        raise
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
+@_manage_clients
+def fetch_active_service_requests(
+    access_token: str,
+    provider_id: str,
+) -> list[dict[str, Any]]:
+    if not provider_id.strip():
+        raise ValueError("Provider ID is required")
+    client = _authenticated_client(access_token)
+    try:
+        result = (
+            client.table("service_requests")
+            .select("*")
+            .eq("provider_id", provider_id)
+            .in_("status", ["accepted", "in_progress"])
+            .execute()
+            .data
+        )
+        if not isinstance(result, list):
+            raise SupabaseBackendError(
+                502,
+                "Supabase returned an invalid active request list",
+            )
+        logger.info("Active service request query returned count=%s", len(result))
+        return result
+    except SupabaseBackendError:
+        raise
     except Exception as error:
         raise _translate_error(error) from error
 
@@ -541,6 +584,27 @@ def create_service_request(
         row = result[0] if isinstance(result, list) and result else result
         if not isinstance(row, dict):
             raise SupabaseBackendError(502, "Supabase returned an invalid service request")
+        if (
+            row.get("id") is None
+            or row.get("status") != "pending"
+            or row.get("provider_id") is not None
+        ):
+            logger.error(
+                "Created service request has invalid availability status=%s provider_assigned=%s has_id=%s",
+                row.get("status"),
+                row.get("provider_id") is not None,
+                row.get("id") is not None,
+            )
+            raise SupabaseBackendError(
+                502,
+                "Supabase did not create an available pending request",
+            )
+        logger.info(
+            "Created service request status=%s service_type=%s provider_assigned=%s",
+            row["status"],
+            row.get("service_type"),
+            row.get("provider_id") is not None,
+        )
         return {**row, "request_id": row.get("id")}
     except SupabaseBackendError:
         raise
