@@ -29,6 +29,7 @@ from supabase_backend import (
     create_service_request as create_service_request_supabase,
     delete_profile_photo as delete_profile_photo_supabase,
     delete_vehicle as delete_vehicle_supabase,
+    fetch_active_service_requests as fetch_active_service_requests_supabase,
     fetch_pending_requests as fetch_pending_requests_supabase,
     fetch_service_request as fetch_service_request_supabase,
     fetch_service_messages as fetch_service_messages_supabase,
@@ -42,6 +43,7 @@ from supabase_backend import (
     send_service_message as send_service_message_supabase,
     sign_in as sign_in_supabase,
     sign_up as sign_up_supabase,
+    start_service_request as start_service_request_supabase,
     upload_profile_photo as upload_profile_photo_supabase,
 )
 
@@ -59,7 +61,6 @@ def _load_project_environment(env_file: Path | None = None) -> bool:
 _load_project_environment()
 
 logger = logging.getLogger(__name__)
-pending_provider_requests: list[dict] = [] # Deprecated: provider requests are loaded from Supabase.
 LOGIN_BACKGROUND_VIDEO_URL = "/Pippit_0924_TruckTracking.mp4"
 
 
@@ -673,7 +674,7 @@ def build_atendimento_mock(request: dict, provider_coords: list[float]) -> dict:
         "distance": request.get("distance", "0.0 km"),
         "eta": request.get("eta", "15 min"),
         "maps_url": request.get("maps_url", "#"),
-        "user_coords": request.get("coords", [-23.5505, -46.6333]),
+        "user_coords": request.get("coords"),
         "provider_coords": provider_coords,
         "service_icon": request.get("service_icon", "🛠️"),
     }
@@ -739,6 +740,35 @@ class AuthState(rx.State):
     def profile_photo_preview(self) -> str:
         """Return the staged profile image before the persisted photo."""
         return self.selected_profile_image or self.user_profile_photo
+
+    @rx.var
+    def profile_has_photo(self) -> bool:
+        return bool(self.profile_photo_preview)
+
+    @rx.var
+    def profile_has_name(self) -> bool:
+        name = self.user_full_name.strip()
+        return bool(name and name != "Usuário SOS")
+
+    @rx.var
+    def profile_has_valid_cpf(self) -> bool:
+        return len(digits_only(self.user_cpf)) == 11
+
+    @rx.var
+    def profile_has_valid_phone(self) -> bool:
+        phone = digits_only(self.user_phone)
+        return self.user_phone != "(11) 99999-9999" and len(phone) in {10, 11}
+
+    @rx.var
+    def profile_completed_fields(self) -> int:
+        return sum(
+            (
+                self.profile_has_photo,
+                self.profile_has_name,
+                self.profile_has_valid_cpf,
+                self.profile_has_valid_phone,
+            )
+        )
 
     @rx.var(interval=1)
     def resend_seconds_remaining(self) -> int:
@@ -892,6 +922,7 @@ class AuthState(rx.State):
         return rx.redirect("/test-map")
 
     def logout(self) -> None:
+        self.session_validated = False
         self.clear_session()
         self.email = ""
         self.password = ""
@@ -1231,6 +1262,7 @@ class OperationalState(rx.State):
     # { provider_id: {"lat": float, "lng": float, "timestamp": float} }
     provider_locations: dict[int, dict] = {}
     client_location: dict[str, float] = {"lat": 0.0, "lng": 0.0}
+    client_location_received: bool = False
     lat_lng_update_value: str = ""
 
     # Mock Data for Active Calls
@@ -1243,6 +1275,7 @@ class OperationalState(rx.State):
     pending_requests_loading: bool = False
     pending_requests_error: str = ""
     pending_requests_polling: bool = False
+    is_ending_request: bool = False
     selected_request: dict = {}
     atendimento_mock: dict = {}
     atendimento_phase: str = ""
@@ -1259,19 +1292,33 @@ class OperationalState(rx.State):
 
     @rx.var
     def has_available_requests(self) -> bool:
-        return bool(self.available_requests)
+        return bool(self.provider_home_requests)
 
     @rx.var
     def nearby_requests_summary(self) -> str:
-        count = len(self.available_requests)
+        count = len(self.provider_home_requests)
         noun = "chamado" if count == 1 else "chamados"
         return f"{count} {noun} na sua região, do mais perto ao mais longe."
+
+    @rx.var
+    def has_active_requests(self) -> bool:
+        return any(request.get("is_active", False) for request in self.available_requests)
+
+    @rx.var
+    def provider_home_requests(self) -> list[dict]:
+        if self.is_available:
+            return self.available_requests
+        return [
+            request
+            for request in self.available_requests
+            if request.get("is_active", False)
+        ]
     show_client_message_panel: bool = False
 
 
     # Customer Request state
     selected_service: str | None = None
-    request_status: str = "idle" # idle, searching, matched
+    request_status: str = "idle" # idle, searching, matched, completed, cancelled, unknown
     selected_vehicle_id: int | None = None
     selected_vehicle_option: str = ""
     pending_service_type: str = ""
@@ -1279,6 +1326,8 @@ class OperationalState(rx.State):
     request_server_status: str = ""
     request_estimated_price: float = 0.0
     request_distance_km: float = 0.0
+    request_poll_error: str = ""
+    request_summary_dismissed: bool = False
     request_error_message: str = ""
     show_profile_link: bool = False
     show_vehicle_selection: bool = False
@@ -1296,9 +1345,106 @@ class OperationalState(rx.State):
     v_year: str = ""
     v_color: str = ""
 
+    @rx.var
+    def has_profile_vehicles(self) -> bool:
+        return bool(self.user_vehicles)
+
     async def _get_auth_token(self) -> str:
         auth_state = await self.get_state(AuthState)
         return auth_state.auth_token
+
+    def _apply_customer_request_snapshot(self, request: dict) -> bool:
+        """Apply persisted request fields without touching conversation state."""
+        status = str(request.get("status") or "unknown").strip().lower()
+        presentation_status = {
+            "pending": "searching",
+            "accepted": "matched",
+            "in_progress": "matched",
+            "completed": "completed",
+            "cancelled": "cancelled",
+        }.get(status, "unknown")
+
+        if self.request_server_status != status:
+            self.request_server_status = status
+            self.request_summary_dismissed = False
+        if self.request_status != presentation_status:
+            self.request_status = presentation_status
+
+        for field, attribute in (
+            ("estimated_price", "request_estimated_price"),
+            ("distance_km", "request_distance_km"),
+        ):
+            value = request.get(field)
+            if value is None:
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring invalid customer request field=%s", field)
+                continue
+            if not math.isfinite(numeric_value):
+                logger.warning("Ignoring non-finite customer request field=%s", field)
+                continue
+            if getattr(self, attribute) != numeric_value:
+                setattr(self, attribute, numeric_value)
+
+        self.request_poll_error = ""
+        return status in {"completed", "cancelled"}
+
+    def _customer_request_is_pollable(self) -> bool:
+        return (
+            self.request_id is not None
+            and self.request_server_status not in {"completed", "cancelled"}
+        )
+
+    async def _poll_customer_request_once(self) -> bool:
+        """Fetch and apply one request snapshot; return whether auth expired."""
+        async with self:
+            request_id = self.request_id
+            if request_id is None or not self._customer_request_is_pollable():
+                return False
+            token = await self._get_auth_token()
+
+        if not token:
+            async with self:
+                if self.request_id == request_id:
+                    self.request_poll_error = (
+                        "Não foi possível atualizar o chamado. Verifique sua sessão."
+                    )
+            return True
+
+        try:
+            request = await asyncio.to_thread(
+                fetch_service_request_supabase,
+                token,
+                request_id,
+            )
+            async with self:
+                if self.request_id != request_id:
+                    return False
+                if request is None:
+                    self.request_poll_error = (
+                        "Não foi possível localizar o chamado. Tentando novamente."
+                    )
+                else:
+                    self._apply_customer_request_snapshot(request)
+        except SupabaseBackendError as error:
+            logger.error("Client request status poll failed status=%s", error.status_code)
+            if error.status_code == 401:
+                return True
+            async with self:
+                if self.request_id == request_id:
+                    self.request_poll_error = (
+                        "Não foi possível atualizar o chamado. Tentando novamente."
+                    )
+        except (requests.RequestException, TypeError, ValueError) as error:
+            logger.error("Client request status poll failed category=%s", type(error).__name__)
+            async with self:
+                if self.request_id == request_id:
+                    self.request_poll_error = (
+                        "Não foi possível atualizar o chamado. Tentando novamente."
+                    )
+        return False
 
     async def _get_auth_identity(self) -> tuple[str, str]:
         auth_state = await self.get_state(AuthState)
@@ -1461,6 +1607,22 @@ class OperationalState(rx.State):
         self.providers = list(self.providers)
 
     @staticmethod
+    def _validated_coordinates(latitude: Any, longitude: Any) -> list[float] | None:
+        try:
+            lat = float(latitude)
+            lng = float(longitude)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(lat)
+            or not math.isfinite(lng)
+            or not -90 <= lat <= 90
+            or not -180 <= lng <= 180
+        ):
+            return None
+        return [lat, lng]
+
+    @staticmethod
     def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Return the great-circle distance between two coordinates in kilometers."""
         lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
@@ -1486,16 +1648,40 @@ class OperationalState(rx.State):
         }
         friendly_name, icon = type_map.get(service_type, ("Solicitação", "🛠️"))
 
-        # Calculate distance from provider's current location
-        provider_lat = self.provider_locations.get(self.current_provider_id, {}).get("lat", self.providers[0]["coords"][0] if self.providers else -23.55)
-        provider_lng = self.provider_locations.get(self.current_provider_id, {}).get("lng", self.providers[0]["coords"][1] if self.providers else -46.63)
-        req_lat = request_data.get("latitude", 0.0)
-        req_lng = request_data.get("longitude", 0.0)
+        provider_location = self.provider_locations.get(self.current_provider_id) or {}
+        provider_coords = self._validated_coordinates(
+            provider_location.get("lat"),
+            provider_location.get("lng"),
+        )
+        if provider_coords is None and self.providers:
+            fallback_coords = self.providers[0].get("coords", [])
+            if isinstance(fallback_coords, (list, tuple)) and len(fallback_coords) == 2:
+                provider_coords = self._validated_coordinates(*fallback_coords)
+        if provider_coords is None:
+            provider_coords = [-23.55, -46.63]
 
-        dist_km = self._haversine(provider_lat, provider_lng, req_lat, req_lng)
-
-        # Construct Google Maps URL
-        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={req_lat},{req_lng}"
+        request_coords = self._validated_coordinates(
+            request_data.get("latitude"),
+            request_data.get("longitude"),
+        )
+        dist_km = None
+        distance = "Distância indisponível"
+        eta = "Tempo estimado indisponível"
+        maps_url = ""
+        if request_coords is not None:
+            req_lat, req_lng = request_coords
+            dist_km = self._haversine(
+                provider_coords[0],
+                provider_coords[1],
+                req_lat,
+                req_lng,
+            )
+            distance = f"{dist_km:.1f} km"
+            eta = f"{int(dist_km * 3 + 5)} min"
+            maps_url = (
+                "https://www.google.com/maps/dir/?api=1"
+                f"&destination={req_lat},{req_lng}"
+            )
         user_record = request_data.get("_user") or request_data.get("user") or {}
         vehicle_record = request_data.get("_vehicle") or request_data.get("vehicle") or {}
         vehicle_details = request_data.get("vehicle_details") or vehicle_record.get("details")
@@ -1514,6 +1700,8 @@ class OperationalState(rx.State):
 
         return {
             "id": request_data.get("id"),
+            "status": request_data.get("status", "pending"),
+            "is_active": request_data.get("status") in {"accepted", "in_progress"},
             "type": friendly_name,
             "service_icon": icon,
             "user": user_record.get("name") or request_data.get("user_name") or request_data.get("name") or "Usuário",
@@ -1524,66 +1712,208 @@ class OperationalState(rx.State):
             or request_data.get("address")
             or request_data.get("note")
             or "Cliente aguardando atendimento.",
-            "distance": f"{dist_km:.1f} km",
-            "eta": f"{int(dist_km * 3 + 5)} min", # Simple mock ETA based on distance
+            "distance": distance,
+            "_distance_km": dist_km,
+            "eta": eta,
             "address": request_data.get("address") or "Endereço não informado",
-            "coords": [req_lat, req_lng],
+            "coords": request_coords,
             "maps_url": maps_url,
         }
 
+    def _combine_provider_requests(
+        self,
+        pending_requests: list[dict],
+        active_requests: list[dict],
+    ) -> list[dict]:
+        cached_requests = {
+            str(request.get("id")): request
+            for request in self.available_requests
+            if request.get("id") is not None
+        }
+        active = []
+        for request_data in active_requests:
+            request = self._map_service_request_to_ui(request_data)
+            request_id = str(request.get("id"))
+            cached_request = cached_requests.get(request_id)
+            if cached_request:
+                for field in (
+                    "type",
+                    "service_icon",
+                    "user",
+                    "phone",
+                    "vehicle",
+                    "note",
+                    "description",
+                    "address",
+                    "eta",
+                    "maps_url",
+                ):
+                    if cached_request.get(field):
+                        request[field] = cached_request[field]
+
+            attendance = self.atendimento_mock
+            if str(attendance.get("id")) == request_id:
+                for field, value in {
+                    "type": attendance.get("tipo_problema"),
+                    "service_icon": attendance.get("service_icon"),
+                    "user": attendance.get("nome"),
+                    "phone": attendance.get("phone"),
+                    "vehicle": attendance.get("veiculo"),
+                    "note": attendance.get("observacao"),
+                    "address": attendance.get("endereco"),
+                    "eta": attendance.get("eta"),
+                    "maps_url": attendance.get("maps_url"),
+                }.items():
+                    if value:
+                        request[field] = value
+            request["is_active"] = True
+            active.append(request)
+
+        active_ids = {str(request.get("id")) for request in active}
+        pending = []
+        for request_data in pending_requests:
+            request = self._map_service_request_to_ui(request_data)
+            if str(request.get("id")) in active_ids:
+                continue
+            request["is_active"] = False
+            pending.append(request)
+
+        active.sort(
+            key=lambda request: (
+                request["_distance_km"]
+                if request.get("_distance_km") is not None
+                else float("inf")
+            )
+        )
+        pending.sort(
+            key=lambda request: (
+                request["_distance_km"]
+                if request.get("_distance_km") is not None
+                else float("inf")
+            )
+        )
+        return active + pending
+
+    async def _fetch_provider_requests(self, token: str, provider_id: str) -> list[dict]:
+        pending_requests, active_requests = await asyncio.gather(
+            asyncio.to_thread(fetch_pending_requests_supabase, token),
+            asyncio.to_thread(
+                fetch_active_service_requests_supabase,
+                token,
+                provider_id,
+            ),
+        )
+        logger.info(
+            "Provider request snapshot returned pending=%s active=%s",
+            len(pending_requests),
+            len(active_requests),
+        )
+        return self._combine_provider_requests(pending_requests, active_requests)
+
+    async def refresh_provider_requests(self) -> None:
+        """Refresh pending and active requests after an attendance transition."""
+        token, provider_id = await self._get_auth_identity()
+        if not token or not provider_id:
+            self.pending_requests_error = (
+                "Sua sessão expirou. Entre novamente para carregar os chamados."
+            )
+            return
+        try:
+            self.available_requests = await self._fetch_provider_requests(
+                token,
+                provider_id,
+            )
+            self.pending_requests_error = ""
+        except SupabaseBackendError as error:
+            self.pending_requests_error = (
+                "Não foi possível carregar os chamados próximos. Tente novamente."
+            )
+            logger.error("Provider request refresh failed status=%s", error.status_code)
+        except (requests.RequestException, ValueError) as error:
+            self.pending_requests_error = (
+                "Não foi possível carregar os chamados próximos. Tente novamente."
+            )
+            logger.error(
+                "Provider request refresh failed category=%s",
+                type(error).__name__,
+            )
+
     @rx.event(background=True)
     async def poll_pending_requests(self):
-        """Background task that fetches pending Supabase requests every 20 seconds."""
+        """Refresh provider requests every 20 seconds after the initial load."""
         async with self:
             if self.pending_requests_polling:
                 return
             self.pending_requests_polling = True
-            if not self.available_requests:
-                self.pending_requests_loading = True
-
-        while True:
-            async with self:
-                token = await self._get_auth_token()
-            if not token:
-                async with self:
-                    self.pending_requests_loading = False
-                    self.pending_requests_error = (
-                        "Sua sessão expirou. Entre novamente para carregar os chamados."
+        logger.info("Provider request polling started")
+        try:
+            while True:
+                await asyncio.sleep(20)
+                try:
+                    async with self:
+                        token, provider_id = await self._get_auth_identity()
+                except (SupabaseBackendError, requests.RequestException, ValueError) as error:
+                    async with self:
+                        self.pending_requests_error = (
+                            "Não foi possível validar sua sessão para carregar os chamados."
+                        )
+                    logger.error(
+                        "Provider request poll identity failed category=%s",
+                        type(error).__name__,
                     )
-                logger.warning("Polling skipped: No auth token available")
-                await asyncio.sleep(10)
-                continue
+                    continue
 
-            try:
-                raw_requests = await asyncio.to_thread(
-                    fetch_pending_requests_supabase,
-                    token,
+                logger.info(
+                    "Provider request poll identity available authenticated=%s provider_identity_available=%s",
+                    bool(token),
+                    bool(provider_id),
                 )
-                mapped_requests = [
-                    self._map_service_request_to_ui(request)
-                    for request in raw_requests
-                ]
-                async with self:
-                    self.available_requests = mapped_requests
-                    self.pending_requests_error = ""
-                    self.pending_requests_loading = False
-                logger.info("Polled %s pending Supabase requests", len(mapped_requests))
-            except SupabaseBackendError as error:
-                async with self:
-                    self.pending_requests_error = (
-                        "Não foi possível carregar os chamados próximos. Tente novamente."
-                    )
-                    self.pending_requests_loading = False
-                logger.error("Failed to poll pending requests status=%s", error.status_code)
-            except (requests.RequestException, ValueError) as error:
-                async with self:
-                    self.pending_requests_error = (
-                        "Não foi possível carregar os chamados próximos. Tente novamente."
-                    )
-                    self.pending_requests_loading = False
-                logger.error("Failed to poll pending requests category=%s", type(error).__name__)
+                if not token or not provider_id:
+                    async with self:
+                        self.pending_requests_loading = False
+                        self.pending_requests_error = (
+                            "Sua sessão expirou. Entre novamente para carregar os chamados."
+                        )
+                    logger.warning("Provider request poll skipped: authentication unavailable")
+                    continue
 
-            await asyncio.sleep(20)
+                try:
+                    mapped_requests = await self._fetch_provider_requests(
+                        token,
+                        provider_id,
+                    )
+                    async with self:
+                        self.available_requests = mapped_requests
+                        self.pending_requests_error = ""
+                        self.pending_requests_loading = False
+                    logger.info(
+                        "Provider request poll applied count=%s",
+                        len(mapped_requests),
+                    )
+                except SupabaseBackendError as error:
+                    async with self:
+                        self.pending_requests_error = (
+                            "Não foi possível carregar os chamados próximos. Tente novamente."
+                        )
+                        self.pending_requests_loading = False
+                    logger.error(
+                        "Provider request poll failed status=%s",
+                        error.status_code,
+                    )
+                except (requests.RequestException, ValueError) as error:
+                    async with self:
+                        self.pending_requests_error = (
+                            "Não foi possível carregar os chamados próximos. Tente novamente."
+                        )
+                        self.pending_requests_loading = False
+                    logger.error(
+                        "Provider request poll failed category=%s",
+                        type(error).__name__,
+                    )
+        finally:
+            async with self:
+                self.pending_requests_polling = False
+            logger.info("Provider request polling stopped")
 
     @rx.event
     async def load_pending_requests(self):
@@ -1592,22 +1922,32 @@ class OperationalState(rx.State):
             return
         self.pending_requests_loading = True
         self.pending_requests_error = ""
+        logger.info("Provider request initial load started")
         yield
         try:
-            token = await self._get_auth_token()
-            if not token:
+            token, provider_id = await self._get_auth_identity()
+            logger.info(
+                "Provider request initial load identity available authenticated=%s provider_identity_available=%s",
+                bool(token),
+                bool(provider_id),
+            )
+            if not token or not provider_id:
                 self.pending_requests_error = (
                     "Sua sessão expirou. Entre novamente para carregar os chamados."
                 )
+                logger.warning(
+                    "Provider request initial load skipped: authentication unavailable"
+                )
                 return
-            raw_requests = await asyncio.to_thread(
-                fetch_pending_requests_supabase,
+            mapped_requests = await self._fetch_provider_requests(
                 token,
+                provider_id,
             )
-            self.available_requests = [
-                self._map_service_request_to_ui(request)
-                for request in raw_requests
-            ]
+            self.available_requests = mapped_requests
+            logger.info(
+                "Provider request initial load applied count=%s",
+                len(mapped_requests),
+            )
         except SupabaseBackendError as error:
             self.pending_requests_error = (
                 "Não foi possível carregar os chamados próximos. Tente novamente."
@@ -1626,34 +1966,10 @@ class OperationalState(rx.State):
 
     @rx.event(background=True)
     async def poll_service_request_status(self):
-        """Watch the authenticated client's active request until a provider accepts it."""
+        """Refresh the authenticated client's request until it reaches a terminal state."""
         while True:
-            async with self:
-                if self.request_status != "searching" or self.request_id is None:
-                    request_id = None
-                else:
-                    request_id = self.request_id
-                token = await self._get_auth_token()
-
-            if request_id is not None and token:
-                try:
-                    request = await asyncio.to_thread(
-                        fetch_service_request_supabase,
-                        token,
-                        request_id,
-                    )
-                    if request and request.get("provider_id"):
-                        async with self:
-                            if self.request_id == request_id and self.request_status == "searching":
-                                self.request_server_status = str(request.get("status") or "accepted")
-                                self.request_status = "matched"
-                except SupabaseBackendError as error:
-                    logger.error("Client request status poll failed status=%s", error.status_code)
-                    if error.status_code == 401:
-                        async with self:
-                            return AuthState.expire_session()
-                except (requests.RequestException, ValueError) as error:
-                    logger.error("Client request status poll failed category=%s", type(error).__name__)
+            if await self._poll_customer_request_once():
+                return AuthState.expire_session()
 
             await asyncio.sleep(5)
 
@@ -1685,16 +2001,20 @@ class OperationalState(rx.State):
             logger.error("Supabase request acceptance failed category=%s", type(error).__name__)
             return rx.toast("Não foi possível aceitar o chamado. Tente novamente.")
 
-        self.selected_request = request
+        active_request = {**request, "status": "accepted", "is_active": True}
+        self.selected_request = active_request
 
         # IMPORTANT: We use the selected_request data to populate the atendimento_mock
         provider = next((item for item in self.providers if item["id"] == self.current_provider_id), None)
         provider_coords = provider["coords"] if provider else [-23.5505, -46.6333]
 
-        self.atendimento_mock = build_atendimento_mock(request, provider_coords)
+        self.atendimento_mock = build_atendimento_mock(active_request, provider_coords)
         self.atendimento_phase = "A_CAMINHO"
         self.show_cancel_confirm = False
-        self.available_requests = [item for item in self.available_requests if item["id"] != request_id]
+        self.available_requests = [
+            active_request if str(item["id"]) == str(request_id) else item
+            for item in self.available_requests
+        ]
 
         return rx.redirect("/provider-service-progress")
 
@@ -1712,6 +2032,27 @@ class OperationalState(rx.State):
         if request is None:
             return rx.toast("Solicitação não encontrada na lista local.")
         self.selected_request = request
+        if request.get("is_active"):
+            attendance_id = self.atendimento_mock.get("id")
+            if str(attendance_id) != str(request_id):
+                provider = next(
+                    (item for item in self.providers if item["id"] == self.current_provider_id),
+                    None,
+                )
+                provider_coords = provider["coords"] if provider else [-23.5505, -46.6333]
+                self.atendimento_mock = build_atendimento_mock(request, provider_coords)
+                self.atendimento_phase = (
+                    "ATENDENDO"
+                    if request.get("status") == "in_progress"
+                    else "A_CAMINHO"
+                )
+            elif not self.atendimento_phase:
+                self.atendimento_phase = (
+                    "ATENDENDO"
+                    if request.get("status") == "in_progress"
+                    else "A_CAMINHO"
+                )
+            return rx.redirect("/provider-service-progress")
         return rx.redirect("/service-details")
 
     def reset_provider_home(self):
@@ -1724,6 +2065,83 @@ class OperationalState(rx.State):
         self.atendimento_mock = {}
         self.atendimento_phase = ""
         self.show_cancel_confirm = False
+
+    async def encerrar_chamado(self):
+        """Complete the selected or active request and return to provider home."""
+        if self.is_ending_request:
+            return
+
+        request_id = self.atendimento_mock.get("id")
+        selected_id = self.selected_request.get("id")
+        selected_status = self.selected_request.get("status")
+        selected_is_active = (
+            self.selected_request.get("is_active")
+            or selected_status in {"accepted", "in_progress"}
+        )
+        if (
+            request_id is None
+            or self.atendimento_phase not in {"A_CAMINHO", "NO_LOCAL", "ATENDENDO"}
+            or (
+                selected_id is not None
+                and (
+                    str(selected_id) != str(request_id)
+                    or not selected_is_active
+                )
+            )
+        ):
+            yield rx.toast("Aceite o chamado antes de tentar encerrá-lo.")
+            return
+
+        self.is_ending_request = True
+        yield
+        result_event = None
+        try:
+            token = await self._get_auth_token()
+            if not token:
+                auth_state = await self.get_state(AuthState)
+                result_event = auth_state.expire_session()
+            else:
+                result = await asyncio.to_thread(
+                    complete_service_request_supabase,
+                    token,
+                    request_id,
+                )
+                if result.get("status") != "completed":
+                    raise ValueError("Unexpected service request completion status")
+
+                self.available_requests = [
+                    request
+                    for request in self.available_requests
+                    if str(request.get("id")) != str(request_id)
+                ]
+                self.close_message_panel()
+                self.service_messages = []
+                self.message_draft = ""
+                self.reset_atendimento()
+                await self.refresh_provider_requests()
+                result_event = rx.redirect("/home_provider")
+        except SupabaseBackendError as error:
+            logger.error("Supabase request completion failed status=%s", error.status_code)
+            if error.status_code == 401:
+                auth_state = await self.get_state(AuthState)
+                result_event = auth_state.expire_session()
+            else:
+                result_event = rx.toast(
+                    "Não foi possível encerrar o chamado. Verifique se ele ainda está ativo e tente novamente."
+                )
+        except (requests.RequestException, ValueError) as error:
+            logger.error(
+                "Supabase request completion failed category=%s",
+                type(error).__name__,
+            )
+            result_event = rx.toast(
+                "Não foi possível encerrar o chamado. Tente novamente."
+            )
+        finally:
+            self.is_ending_request = False
+
+        if result_event is not None:
+            yield result_event
 
     @rx.var
     def atendimento_next_action_label(self) -> str:
@@ -1760,18 +2178,25 @@ class OperationalState(rx.State):
         return self.atendimento_mock.get("provider_coords", [-23.5505, -46.6333])
 
     @rx.var
-    def atendimento_user_coords(self) -> list[float]:
+    def atendimento_user_coords(self) -> list[float] | None:
         """User coordinates for the current attendance map route."""
-        return self.atendimento_mock.get("user_coords", [-23.5614, -46.6559])
+        coords = self.atendimento_mock.get("user_coords", [-23.5614, -46.6559])
+        if not isinstance(coords, (list, tuple)) or len(coords) != 2:
+            return None
+        return self._validated_coordinates(coords[0], coords[1])
 
     @rx.var
     def atendimento_route_script(self) -> str:
         """Script that initializes map and renders the current route."""
         provider = self.atendimento_provider_coords
         user = self.atendimento_user_coords
-        return (
+        script = (
             "window.initSOSMap('provider-service-progress-map', "
             f"[{provider[0]}, {provider[1]}], 13);"
+        )
+        if user is None:
+            return script
+        return script + (
             "window.showSOSRoute('provider-service-progress-map', "
             f"[{provider[0]}, {provider[1]}], "
             f"[{user[0]}, {user[1]}]);"
@@ -1797,7 +2222,13 @@ class OperationalState(rx.State):
                 logger.error("Supabase request release failed status=%s", error.status_code)
                 return rx.toast("Não foi possível liberar o chamado. Tente novamente.")
 
+        self.available_requests = [
+            request
+            for request in self.available_requests
+            if str(request.get("id")) != str(request_id)
+        ]
         self.reset_atendimento()
+        await self.refresh_provider_requests()
         return rx.redirect("/home_provider")
 
     async def advance_atendimento_phase(self):
@@ -1809,17 +2240,75 @@ class OperationalState(rx.State):
             self.atendimento_phase = "NO_LOCAL"
             return
         if self.atendimento_phase == "NO_LOCAL":
+            if not request_id:
+                return rx.toast("Não há chamado ativo para iniciar.")
+            if not token:
+                auth_state = await self.get_state(AuthState)
+                return auth_state.expire_session()
+            try:
+                await asyncio.to_thread(
+                    start_service_request_supabase,
+                    token,
+                    request_id,
+                )
+            except SupabaseBackendError as error:
+                logger.error("Supabase request start failed status=%s", error.status_code)
+                if error.status_code == 401:
+                    auth_state = await self.get_state(AuthState)
+                    return auth_state.expire_session()
+                return rx.toast("Não foi possível iniciar o atendimento. Tente novamente.")
+            except (requests.RequestException, ValueError) as error:
+                logger.error(
+                    "Supabase request start failed category=%s",
+                    type(error).__name__,
+                )
+                return rx.toast("Não foi possível iniciar o atendimento. Tente novamente.")
             self.atendimento_phase = "ATENDENDO"
+            self.selected_request = {
+                **self.selected_request,
+                "status": "in_progress",
+                "is_active": True,
+            }
+            self.available_requests = [
+                {
+                    **request,
+                    "status": "in_progress",
+                    "is_active": True,
+                }
+                if str(request.get("id")) == str(request_id)
+                else request
+                for request in self.available_requests
+            ]
             return
         if self.atendimento_phase == "ATENDENDO":
+            if not request_id:
+                return rx.toast("Não há chamado ativo para concluir.")
+            if not token:
+                auth_state = await self.get_state(AuthState)
+                return auth_state.expire_session()
             self.atendimento_phase = "CONCLUIDO"
-            if request_id and token:
-                try:
-                    await asyncio.to_thread(complete_service_request_supabase, token, request_id)
-                except SupabaseBackendError as error:
-                    logger.error("Supabase request completion failed status=%s", error.status_code)
-                    self.atendimento_phase = "ATENDENDO"
-                    return rx.toast("Não foi possível concluir o chamado. Tente novamente.")
+            try:
+                await asyncio.to_thread(complete_service_request_supabase, token, request_id)
+            except SupabaseBackendError as error:
+                logger.error("Supabase request completion failed status=%s", error.status_code)
+                self.atendimento_phase = "ATENDENDO"
+                if error.status_code == 401:
+                    auth_state = await self.get_state(AuthState)
+                    return auth_state.expire_session()
+                return rx.toast("Não foi possível concluir o chamado. Tente novamente.")
+            except (requests.RequestException, ValueError) as error:
+                logger.error(
+                    "Supabase request completion failed category=%s",
+                    type(error).__name__,
+                )
+                self.atendimento_phase = "ATENDENDO"
+                return rx.toast("Não foi possível concluir o chamado. Tente novamente.")
+            self.available_requests = [
+                request
+                for request in self.available_requests
+                if str(request.get("id")) != str(request_id)
+            ]
+            await self.refresh_provider_requests()
             return rx.redirect("/service-finalized")
 
     def finish_atendimento_and_back_home(self):
@@ -1845,6 +2334,7 @@ class OperationalState(rx.State):
     def update_client_location(self, lat: float, lng: float):
         """Update the client's real-time location."""
         self.client_location = {"lat": lat, "lng": lng}
+        self.client_location_received = True
 
     def handle_lat_lng_update(self, value: str):
         """Handle location updates from the JS bridge via a hidden input."""
@@ -2189,11 +2679,25 @@ class OperationalState(rx.State):
                 self.show_vehicle_selection = True
                 return rx.toast("Selecione um veículo para continuar.")
 
-        latitude = self.client_location.get("lat", 0.0)
-        longitude = self.client_location.get("lng", 0.0)
-        if not latitude or not longitude:
+        if not self.client_location_received:
             self.request_status = "idle"
             self.request_error_message = "Ative sua localização antes de pedir socorro."
+            return rx.toast(self.request_error_message)
+        try:
+            latitude = float(self.client_location["lat"])
+            longitude = float(self.client_location["lng"])
+        except (KeyError, TypeError, ValueError):
+            self.request_status = "idle"
+            self.request_error_message = "Ative sua localização antes de pedir socorro."
+            return rx.toast(self.request_error_message)
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            self.request_status = "idle"
+            self.request_error_message = "A localização recebida é inválida."
             return rx.toast(self.request_error_message)
 
         token = await self._get_auth_token()
@@ -2218,9 +2722,15 @@ class OperationalState(rx.State):
             self.request_estimated_price = float(result.get("estimated_price", 0.0))
             self.request_distance_km = float(result.get("distance_km", 0.0))
             self.request_status = "searching"
-            # Keep the request hidden from the provider queue while the customer is still
-            # actively searching. Only real acceptance should expose it to providers.
-            pending_provider_requests[:] = []
+            self.request_poll_error = ""
+            self.request_summary_dismissed = False
+            logger.info(
+                "Customer request accepted by Supabase status=%s service_type=%s provider_assigned=%s has_id=%s",
+                self.request_server_status,
+                service_type,
+                result.get("provider_id") is not None,
+                self.request_id is not None,
+            )
             return
         except SupabaseBackendError as error:
             logger.error(
@@ -2273,25 +2783,49 @@ class OperationalState(rx.State):
         self.request_status = "matched"
 
     async def set_request_status(self, status: str):
-        """Cancel a searching request before resetting its local presentation state."""
+        """Cancel a pending request and retain a short terminal notice."""
         if status != "idle":
             raise ValueError("Unsupported local request status transition")
-        if self.request_id is not None:
-            token = await self._get_auth_token()
-            if not token:
+        request_id = self.request_id
+        if request_id is None or self.request_server_status != "pending":
+            return rx.toast("Este chamado não pode mais ser cancelado.")
+        token = await self._get_auth_token()
+        if not token:
+            return AuthState.expire_session()
+        try:
+            result = await asyncio.to_thread(
+                cancel_service_request_supabase,
+                token,
+                request_id,
+            )
+            if result.get("status") != "cancelled":
+                raise ValueError("Unexpected service request cancellation status")
+        except SupabaseBackendError as error:
+            logger.error("Supabase request cancellation failed status=%s", error.status_code)
+            if error.status_code == 401:
                 return AuthState.expire_session()
-            try:
-                await asyncio.to_thread(
-                    cancel_service_request_supabase,
-                    token,
-                    self.request_id,
-                )
-            except SupabaseBackendError as error:
-                logger.error("Supabase request cancellation failed status=%s", error.status_code)
-                return rx.toast("Não foi possível cancelar o chamado. Tente novamente.")
-        self.request_status = "idle"
+            return rx.toast("Não foi possível cancelar o chamado. Tente novamente.")
+        except (requests.RequestException, ValueError) as error:
+            logger.error(
+                "Supabase request cancellation failed category=%s",
+                type(error).__name__,
+            )
+            return rx.toast("Não foi possível cancelar o chamado. Tente novamente.")
+
         self.request_id = None
-        self.request_server_status = ""
+        self.request_server_status = "cancelled"
+        self.request_status = "cancelled"
+        self.request_poll_error = ""
+        self.request_summary_dismissed = False
+
+    @rx.event
+    def clear_customer_request_summary(self):
+        """Dismiss a terminal summary without mutating the conversation state."""
+        if self.request_server_status not in {"completed", "cancelled"}:
+            return
+        self.request_summary_dismissed = True
+        self.request_status = "idle"
+        self.request_poll_error = ""
 
     def set_provider_name(self, name: str):
         """Update the name of the current simulated provider."""
@@ -2459,6 +2993,8 @@ def vehicle_modal() -> rx.Component:
                                 placeholder="Digite a marca do veículo",
                                 on_change=OperationalState.set_v_brand,
                                 class_name="vehicle-modal-input",
+                                color="#000000",
+                                _placeholder={"color": "#4B5563", "opacity": "1"},
                             ),
                             class_name="vehicle-modal-field",
                         ),
@@ -2469,6 +3005,8 @@ def vehicle_modal() -> rx.Component:
                                 placeholder="Digite o modelo do veículo",
                                 on_change=OperationalState.set_v_model,
                                 class_name="vehicle-modal-input",
+                                color="#000000",
+                                _placeholder={"color": "#4B5563", "opacity": "1"},
                             ),
                             class_name="vehicle-modal-field",
                         ),
@@ -2479,6 +3017,8 @@ def vehicle_modal() -> rx.Component:
                                 placeholder="Digite a placa do veículo",
                                 on_change=OperationalState.set_v_plate,
                                 class_name="vehicle-modal-input",
+                                color="#000000",
+                                _placeholder={"color": "#4B5563", "opacity": "1"},
                             ),
                             class_name="vehicle-modal-field",
                         ),
@@ -2492,6 +3032,8 @@ def vehicle_modal() -> rx.Component:
                                     max_length=4,
                                     input_mode="numeric",
                                     class_name="vehicle-modal-input",
+                                    color="#000000",
+                                    _placeholder={"color": "#4B5563", "opacity": "1"},
                                 ),
                                 class_name="vehicle-modal-field",
                             ),
@@ -2502,6 +3044,8 @@ def vehicle_modal() -> rx.Component:
                                     placeholder="Digite a cor do veículo",
                                     on_change=OperationalState.set_v_color,
                                     class_name="vehicle-modal-input",
+                                    color="#000000",
+                                    _placeholder={"color": "#4B5563", "opacity": "1"},
                                 ),
                                 class_name="vehicle-modal-field",
                             ),
@@ -3024,240 +3568,396 @@ def vehicle_selection_sheet() -> rx.Component:
     )
 
 
+def customer_progress_item(step_index: int, label: str) -> rx.Component:
+    status = OperationalState.request_server_status
+    if step_index <= 2:
+        is_active = (
+            (status == "accepted")
+            | (status == "in_progress")
+            | (status == "completed")
+        )
+    elif step_index == 3:
+        is_active = (status == "in_progress") | (status == "completed")
+    else:
+        is_active = status == "completed"
+
+    return rx.vstack(
+        rx.box(
+            str(step_index),
+            class_name=rx.cond(
+                is_active,
+                "customer-progress-node is-active",
+                "customer-progress-node",
+            ),
+        ),
+        rx.text(label, class_name="customer-progress-label"),
+        align="center",
+        spacing="1",
+        class_name="customer-progress-item",
+    )
+
+
 def customer_dashboard() -> rx.Component:
-    return rx.box(
-        # Map Container (Background)
-        rx.box(
-            id="customer-map",
-            width="100%",
-            height="100vh",
-            position="absolute",
-            top="0",
-            left="0",
-            z_index="0",
-            on_mount=rx.call_script(
-                "window.initSOSMap('customer-map', [-23.5505, -46.6333], 13);"
-            ),
-        ),
-        vehicle_selection_sheet(),
-        # Top Navigation Bar
-        rx.hstack(
-            rx.button(
-                rx.text("🏠 Home"),
-                on_click=rx.redirect("/home"),
-                class_name="glass-panel",
-                padding="0.5rem 1rem",
-                border_radius="12px",
-                font_size="0.8rem",
-                weight="bold",
-                cursor="pointer",
-            ),
-            rx.spacer(),
-            profile_avatar(),
-            position="absolute",
-            top="2rem",
-            left="2rem",
-            right="2rem",
-            z_index="100",
-            pointer_events="auto",
-            align="center",
-        ),
-        # Floating Status Pill
-        rx.box(
-            rx.hstack(
-                rx.text("📡", font_size="1.2rem"),
-                rx.text(
-                    f"{OperationalState.online_providers_count} profissionais disponíveis agora",
-                    weight="bold",
-                    font_size="0.85rem",
-                    color=COLORS["text"],
-                    text_align="center",
+    status = OperationalState.request_server_status
+    terminal_status = (status == "completed") | (status == "cancelled")
+    status_visible = (
+        (status != "")
+        & (~OperationalState.request_summary_dismissed)
+        & (~((OperationalState.request_status == "searching") & terminal_status))
+    )
+    show_submission_searching = (OperationalState.request_status == "searching") & (
+        (status == "") | terminal_status
+    )
+    show_progress = (
+        (status == "accepted")
+        | (status == "in_progress")
+        | (status == "completed")
+    )
+    show_metadata = show_progress
+    show_messages = (OperationalState.request_id != None) & (status != "cancelled")
+    can_cancel = (
+        (OperationalState.request_id != None)
+        & (status == "pending")
+    )
+    status_text = rx.cond(
+        status == "pending",
+        "Buscando o melhor profissional...",
+        rx.cond(
+            status == "accepted",
+            "Profissional a caminho!",
+            rx.cond(
+                status == "in_progress",
+                "Atendimento em andamento",
+                rx.cond(
+                    status == "completed",
+                    "Atendimento concluído!",
+                    rx.cond(
+                        status == "cancelled",
+                        "O chamado foi cancelado.",
+                        "Atualizando status do chamado",
+                    ),
                 ),
-                spacing="2",
-                align="center",
-                justify="center",
             ),
-            class_name="glass-panel",
-            padding="0.6rem 1.2rem",
-            position="absolute",
-            top="5.5rem",
-            left="50%",
-            transform="translateX(-50%)",
-            z_index="50",
-            width="auto",
-            max_width="90%",
-            pointer_events="auto",
-            border_radius="999px",
         ),
-        # Center Map Button
-        rx.button(
-            "🎯",
-            on_click=rx.call_script("window.centerMap('customer-map')"),
-            class_name="glass-panel",
-            position="absolute",
-            bottom="15rem",
-            right="1rem",
-            z_index="100",
-            width="3rem",
-            height="3rem",
-            border_radius="50%",
-            pointer_events="auto",
-            cursor="pointer",
-            font_size="1.5rem",
+    )
+    status_class = rx.cond(
+        status == "pending",
+        "customer-status-banner is-searching",
+        rx.cond(
+            status == "accepted",
+            "customer-status-banner is-on-way",
+            rx.cond(
+                status == "in_progress",
+                "customer-status-banner is-in-progress",
+                rx.cond(
+                    status == "completed",
+                    "customer-status-banner is-completed",
+                    rx.cond(
+                        status == "cancelled",
+                        "customer-status-banner is-cancelled",
+                        "customer-status-banner is-unknown",
+                    ),
+                ),
+            ),
         ),
-        # Bottom Sheet for Help Selection
+    )
+
+    return rx.box(
         rx.vstack(
-            # Bottom sheet handle
-            rx.box(
-                width="40px",
-                height="4px",
-                background=COLORS["line"],
-                border_radius="2px",
-                margin_bottom="1.5rem",
+            rx.hstack(
+                rx.hstack(
+                    rx.button(
+                        rx.hstack(
+                            rx.box("✦", class_name="customer-brand-mark"),
+                            rx.text("SOS Drive", class_name="customer-brand-name"),
+                            align="center",
+                            spacing="2",
+                        ),
+                        on_click=rx.redirect("/home"),
+                        class_name="customer-brand-link",
+                        aria_label="SOS Drive - início",
+                    ),
+                    rx.box(class_name="customer-header-divider"),
+                    rx.vstack(
+                        rx.heading("Área do cliente", class_name="customer-header-title"),
+                        rx.text(
+                            "Solicite socorro e acompanhe seu atendimento",
+                            class_name="customer-header-subtitle",
+                        ),
+                        align="start",
+                        spacing="1",
+                    ),
+                    align="center",
+                    spacing="4",
+                    class_name="customer-header-brand",
+                ),
+                rx.hstack(
+                    rx.hstack(
+                        rx.box(class_name="customer-availability-dot"),
+                        rx.text(
+                            f"{OperationalState.online_providers_count} profissionais disponíveis agora",
+                        ),
+                        align="center",
+                        spacing="2",
+                        class_name="customer-availability-pill",
+                    ),
+                    rx.box(
+                        profile_avatar(),
+                        class_name="customer-avatar-shell",
+                    ),
+                    align="center",
+                    spacing="3",
+                    class_name="customer-header-actions",
+                ),
+                width="100%",
                 align="center",
+                justify="between",
+                class_name="customer-dashboard-header",
             ),
-            rx.text("Do que você precisa?", weight="bold", size="6", margin_bottom="1rem", color=COLORS["text"], text_align="center"),
             rx.grid(
                 rx.box(
-                    rx.vstack(
-                        rx.text("🚗", font_size="1.8rem"),
-                        rx.text("Pneu Furado", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
-                    ),
-                    on_click=OperationalState.submit_customer_request("tire"),
-                    class_name="op-card",
-                    width="100%",
-                    height="90px",
-                    border_radius="16px",
-                    cursor="pointer",
-                    align="center",
-                    justify="center",
-                ),
-                rx.box(
-                    rx.vstack(
-                        rx.text("🔋", font_size="1.8rem"),
-                        rx.text("Bateria", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
-                    ),
-                    on_click=OperationalState.submit_customer_request("battery"),
-                    class_name="op-card",
-                    width="100%",
-                    height="90px",
-                    border_radius="16px",
-                    cursor="pointer",
-                    align="center",
-                    justify="center",
-                ),
-                rx.box(
-                    rx.vstack(
-                        rx.text("🔧", font_size="1.8rem"),
-                        rx.text("Mecânica", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
-                    ),
-                    on_click=OperationalState.submit_customer_request("mechanical"),
-                    class_name="op-card",
-                    width="100%",
-                    height="90px",
-                    border_radius="16px",
-                    cursor="pointer",
-                    align="center",
-                    justify="center",
-                ),
-                rx.box(
-                    rx.vstack(
-                        rx.text("⛽", font_size="1.8rem"),
-                        rx.text("Combustível", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
-                    ),
-                    on_click=OperationalState.submit_customer_request("fuel"),
-                    class_name="op-card",
-                    width="100%",
-                    height="90px",
-                    border_radius="16px",
-                    cursor="pointer",
-                    align="center",
-                    justify="center",
-                ),
-                columns="2",
-                spacing="3",
-                width="100%",
-            ),
-            # Request Status Overlay
-            rx.cond(
-                OperationalState.request_status == "searching",
-                rx.vstack(
-                    rx.text("Buscando o melhor profissional...", weight="bold", color=COLORS["text"], text_align="center"),
-                    rx.spinner(size="1"),
-                    spacing="3",
-                    align="center",
-                    padding="1.2rem",
-                    width="100%",
-                    background="rgba(255,255,255,0.9)",
-                    border_radius="16px",
-                    margin_top="1rem",
-                    border=f"1px solid {COLORS['line']}",
-                ),
-            ),
-            rx.cond(
-                OperationalState.request_status == "matched",
-                rx.vstack(
-                    rx.text("✅ Profissional encontrado!", weight="bold", color=COLORS["emergency_orange"], text_align="center"),
-                    rx.text(
-                        f"Preço estimado: {OperationalState.request_price_text} · Distância: {OperationalState.request_distance_text}",
-                        font_size="0.9rem",
-                        color=COLORS["text"],
-                        text_align="center",
-                    ),
-                    rx.button("Cancelar Pedido", on_click=OperationalState.set_request_status("idle"), class_name="secondary-button", size="1"),
-                    spacing="3",
-                    align="center",
-                    padding="1.2rem",
-                    width="100%",
-                    background="rgba(255,255,255,0.9)",
-                    border_radius="16px",
-                    margin_top="1rem",
-                    border=f"1px solid {COLORS['line']}",
-                ),
-            ),
-            rx.cond(
-                OperationalState.request_error_message != "",
-                rx.vstack(
-                    rx.text(OperationalState.request_error_message, class_name="error-message", text_align="center"),
-                    rx.cond(
-                        OperationalState.show_profile_link,
-                        rx.button(
-                            "Ir para o perfil",
-                            on_click=OperationalState.open_profile_for_request,
-                            class_name="secondary-button",
+                    rx.box(
+                        id="customer-map",
+                        width="100%",
+                        height="100%",
+                        on_mount=rx.call_script(
+                            "window.initSOSMap('customer-map', [-23.5505, -46.6333], 13);"
                         ),
                     ),
-                    spacing="2",
-                    align="center",
-                    width="100%",
+                    rx.button(
+                        rx.hstack(
+                            rx.icon("locate-fixed", size=16),
+                            rx.text("Centralizar no meu local"),
+                            align="center",
+                            spacing="2",
+                        ),
+                        on_click=rx.call_script("window.centerMap('customer-map')"),
+                        class_name="customer-recenter-button",
+                    ),
+                    class_name="customer-map-frame",
                 ),
-            ),
-            rx.cond(
-                OperationalState.request_id != None,
-                rx.button(
-                    rx.hstack(rx.text("💬"), rx.text("Mensagens do chamado"), spacing="2"),
-                    on_click=[
-                        OperationalState.open_client_message_panel,
-                        OperationalState.poll_service_messages,
-                    ],
-                    class_name="secondary-button",
+                rx.vstack(
+                    rx.vstack(
+                        rx.heading("Do que você precisa?", class_name="customer-request-title"),
+                        rx.text(
+                            "Escolha o tipo de socorro para continuar.",
+                            class_name="customer-request-subtitle",
+                        ),
+                        align="start",
+                        spacing="1",
+                        width="100%",
+                    ),
+                    rx.grid(
+                        rx.box(
+                            rx.vstack(
+                                rx.box("🚗", class_name="customer-service-icon"),
+                                rx.text("Pneu Furado", class_name="customer-service-label"),
+                                align="center",
+                                spacing="2",
+                            ),
+                            on_click=OperationalState.submit_customer_request("tire"),
+                            class_name="op-card customer-service-card",
+                            width="100%",
+                        ),
+                        rx.box(
+                            rx.vstack(
+                                rx.box("🔋", class_name="customer-service-icon"),
+                                rx.text("Bateria", class_name="customer-service-label"),
+                                align="center",
+                                spacing="2",
+                            ),
+                            on_click=OperationalState.submit_customer_request("battery"),
+                            class_name="op-card customer-service-card",
+                            width="100%",
+                        ),
+                        rx.box(
+                            rx.vstack(
+                                rx.box("🔧", class_name="customer-service-icon"),
+                                rx.text("Mecânica", class_name="customer-service-label"),
+                                align="center",
+                                spacing="2",
+                            ),
+                            on_click=OperationalState.submit_customer_request("mechanical"),
+                            class_name="op-card customer-service-card",
+                            width="100%",
+                        ),
+                        rx.box(
+                            rx.vstack(
+                                rx.box("⛽", class_name="customer-service-icon"),
+                                rx.text("Combustível", class_name="customer-service-label"),
+                                align="center",
+                                spacing="2",
+                            ),
+                            on_click=OperationalState.submit_customer_request("fuel"),
+                            class_name="op-card customer-service-card",
+                            width="100%",
+                        ),
+                        columns="2",
+                        spacing="3",
+                        width="100%",
+                        class_name="customer-service-grid",
+                    ),
+                    rx.cond(
+                        status_visible,
+                        rx.vstack(
+                            rx.hstack(
+                                rx.cond(
+                                    OperationalState.request_server_status == "pending",
+                                    rx.spinner(size="1"),
+                                    rx.cond(
+                                        OperationalState.request_server_status == "accepted",
+                                        rx.icon("truck", size=18),
+                                        rx.cond(
+                                            OperationalState.request_server_status == "in_progress",
+                                            rx.icon("wrench", size=18),
+                                            rx.cond(
+                                                OperationalState.request_server_status == "completed",
+                                                rx.icon("circle-check", size=18),
+                                                rx.icon("circle-alert", size=18),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                rx.text(status_text, weight="bold"),
+                                align="center",
+                                spacing="2",
+                                class_name=status_class,
+                            ),
+                            rx.cond(
+                                show_progress,
+                                rx.grid(
+                                    customer_progress_item(1, "Aceito"),
+                                    customer_progress_item(2, "A caminho"),
+                                    customer_progress_item(3, "Em atendimento"),
+                                    customer_progress_item(4, "Concluído"),
+                                    columns="4",
+                                    width="100%",
+                                    class_name="customer-request-progress",
+                                ),
+                            ),
+                            rx.cond(
+                                show_metadata,
+                                rx.hstack(
+                                    rx.box(
+                                        rx.text(
+                                            f"Preço estimado: {OperationalState.request_price_text}",
+                                        ),
+                                        class_name="customer-request-badge",
+                                    ),
+                                    rx.box(
+                                        rx.text(
+                                            f"Distância: {OperationalState.request_distance_text}",
+                                        ),
+                                        class_name="customer-request-badge",
+                                    ),
+                                    width="100%",
+                                    align="center",
+                                    spacing="2",
+                                    class_name="customer-request-metadata",
+                                ),
+                            ),
+                            rx.cond(
+                                (OperationalState.request_server_status == "completed")
+                                | (OperationalState.request_server_status == "cancelled"),
+                                rx.button(
+                                    "Fechar resumo",
+                                    on_click=OperationalState.clear_customer_request_summary,
+                                    class_name="customer-summary-clear-button",
+                                ),
+                            ),
+                            spacing="3",
+                            align="start",
+                            width="100%",
+                            class_name="customer-request-match",
+                        ),
+                    ),
+                    rx.cond(
+                        show_submission_searching,
+                        rx.hstack(
+                            rx.spinner(size="1"),
+                            rx.text(
+                                "Buscando o melhor profissional...",
+                                weight="bold",
+                            ),
+                            align="center",
+                            spacing="2",
+                            width="100%",
+                            class_name="customer-status-banner is-searching",
+                        ),
+                    ),
+                    rx.cond(
+                        OperationalState.request_poll_error != "",
+                        rx.text(
+                            OperationalState.request_poll_error,
+                            class_name="customer-request-poll-error",
+                        ),
+                    ),
+                    rx.cond(
+                        OperationalState.request_error_message != "",
+                        rx.vstack(
+                            rx.text(
+                                OperationalState.request_error_message,
+                                class_name="error-message",
+                                text_align="center",
+                            ),
+                            rx.cond(
+                                OperationalState.show_profile_link,
+                                rx.button(
+                                    "Ir para o perfil",
+                                    on_click=OperationalState.open_profile_for_request,
+                                    class_name="secondary-button",
+                                ),
+                            ),
+                            spacing="2",
+                            align="center",
+                            width="100%",
+                            class_name="customer-request-error",
+                        ),
+                    ),
+                    rx.cond(
+                        show_messages,
+                        rx.button(
+                            rx.hstack(
+                                rx.icon("message-circle", size=18),
+                                rx.text("Mensagens do chamado"),
+                                spacing="2",
+                                align="center",
+                            ),
+                            on_click=[
+                                OperationalState.open_client_message_panel,
+                                OperationalState.poll_service_messages,
+                            ],
+                            class_name="customer-messages-button",
+                            width="100%",
+                        ),
+                    ),
+                    rx.cond(
+                        can_cancel,
+                        rx.button(
+                            "Cancelar Pedido",
+                            on_click=OperationalState.set_request_status("idle"),
+                            class_name="customer-cancel-button",
+                            width="100%",
+                        ),
+                    ),
                     width="100%",
+                    align="start",
+                    spacing="4",
+                    class_name="customer-request-card",
                 ),
+                columns="2",
+                spacing="4",
+                width="100%",
+                class_name="customer-dashboard-content",
             ),
+            flex="1",
+            height="100%",
+            min_height="0",
             width="100%",
-            padding="1rem",
-            background="rgba(255,255,255,0.8)",
-            backdrop_filter="blur(15px)",
-            border_radius="2rem 2rem 0 0",
-            position="absolute",
-            bottom="0",
-            left="0",
-            right="0",
-            z_index="100",
-            border="1px solid rgba(255,255,255,0.5)",
-            box_shadow="0 -10px 30px rgba(0,0,0,0.1)",
-            pointer_events="auto",
+            spacing="5",
+            class_name="customer-dashboard-layout",
         ),
+        vehicle_selection_sheet(),
         client_message_panel(),
         rx.box(
             width="100%",
@@ -3275,10 +3975,11 @@ def customer_dashboard() -> rx.Component:
             display="none",
         ),
         width="100%",
-        height="100vh",
+        min_height="100vh",
         position="relative",
-        overflow="hidden",
-        # Geolocation Trigger
+        display="flex",
+        flex_direction="column",
+        class_name="customer-dashboard-page",
         on_mount=[
             rx.call_script(
                 "navigator.geolocation.getCurrentPosition((pos) => { "
@@ -3305,6 +4006,7 @@ def provider_dashboard() -> rx.Component:
             z_index="0",
             on_mount=[
                 rx.call_script("window.initSOSMap('provider-map', [-23.5505, -46.6333], 13);"),
+                OperationalState.load_pending_requests,
                 OperationalState.poll_pending_requests,
             ],
         ),
@@ -3441,40 +4143,58 @@ def provider_dashboard() -> rx.Component:
 
 def profile_screen() -> rx.Component:
     """Shared authenticated profile screen for clients and providers."""
+    profile_completion = (
+        AppState.profile_completed_fields
+        + rx.cond(OperationalState.has_profile_vehicles, 1, 0)
+    ) * 20
     return rx.center(
         rx.vstack(
             # Top Navigation / Back Button
             rx.hstack(
                 rx.button(
-                    rx.hstack(rx.text("←"), rx.text("Voltar")),
+                    rx.hstack(
+                        rx.icon("arrow-left", size=16),
+                        rx.text("Voltar"),
+                        align="center",
+                        spacing="2",
+                    ),
                     on_click=rx.cond(
                         AppState.user_role == "prestador",
                         rx.redirect("/home_provider"),
                         rx.redirect("/home_client"),
                     ),
                     class_name="profile-back-button",
-                    size="1",
+                    size="2",
                 ),
-                justify="start",
+                rx.spacer(),
+                rx.button(
+                    rx.hstack(
+                        rx.icon("log-out", size=16),
+                        rx.text("Sair"),
+                        align="center",
+                        spacing="2",
+                    ),
+                    on_click=AuthState.logout,
+                    class_name="profile-logout-button",
+                    size="2",
+                ),
+                justify="between",
                 width="100%",
-                margin_bottom="1rem",
                 class_name="profile-topbar",
             ),
             # Header Section
             rx.vstack(
                 rx.heading("Seu perfil", class_name="profile-page-title", size="8"),
                 rx.text(
-                    "Quem atende seu chamado vê estas informações. Perfis completos agilizam o atendimento.",
+                    "Quem acessa seu chamado vê estas informações. Perfis completos agilizam o atendimento.",
                     class_name="profile-page-subtitle",
                 ),
                 align="start",
                 spacing="2",
                 width="100%",
             ),
-            # Main Content Area
             rx.vstack(
-                # Profile Header with Avatar and Upload
-                rx.vstack(
+                rx.hstack(
                     rx.upload(
                         rx.vstack(
                             rx.box(
@@ -3486,25 +4206,38 @@ def profile_screen() -> rx.Component:
                                         height="100%",
                                         border_radius="50%",
                                         object_fit="cover",
+                                        class_name="profile-avatar-image",
                                     ),
                                     rx.center(
-                                        rx.text(AppState.user_initials, font_size="2rem", weight="bold", color=COLORS["text"]),
+                                        rx.text(
+                                            AppState.user_initials,
+                                            font_size="2rem",
+                                            weight="bold",
+                                            color=COLORS["navy"],
+                                        ),
                                         width="100%",
                                         height="100%",
-                                        background=COLORS["line"],
+                                        background="#EAF0F8",
                                         border_radius="50%",
                                     ),
                                 ),
-                                width="100px",
-                                height="100px",
+                                width="112px",
+                                height="112px",
                                 border=f"3px solid {COLORS['emergency_orange']}",
                                 border_radius="50%",
                                 overflow="hidden",
                                 cursor="pointer",
+                                class_name="profile-avatar",
                             ),
-                            rx.text("Alterar Foto", font_size="0.8rem", weight="bold", color=COLORS["navy"]),
+                            rx.hstack(
+                                rx.icon("camera", size=14),
+                                rx.text("Alterar Foto"),
+                                align="center",
+                                spacing="1",
+                                class_name="profile-photo-action",
+                            ),
                             align="center",
-                            spacing="2",
+                            spacing="3",
                         ),
                         on_drop=AppState.handle_profile_upload,
                         accept={"image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"]},
@@ -3512,109 +4245,209 @@ def profile_screen() -> rx.Component:
                         multiple=False,
                         no_drag=False,
                         no_click=False,
-                        class_name="profile-upload-dropzone",
-                    ),
-                    rx.text(AppState.user_full_name, class_name="profile-summary-name"),
-                    rx.text(AppState.user_email, class_name="profile-summary-email"),
-                    rx.text("Perfil completo                         40%", class_name="profile-completion-label"),
-                    rx.box(
-                        rx.box(class_name="profile-completion-fill"),
-                        class_name="profile-completion-track",
+                        class_name="profile-upload-dropzone profile-avatar-column",
                     ),
                     rx.vstack(
-                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Adicione uma foto"), spacing="2"),
-                        rx.hstack(rx.text("✓", class_name="profile-check done"), rx.text("Informe seu nome"), spacing="2"),
-                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Informe um CPF válido"), spacing="2"),
-                        rx.hstack(rx.text("○", class_name="profile-check pending"), rx.text("Informe seu telefone"), spacing="2"),
-                        rx.hstack(rx.text("✓", class_name="profile-check done"), rx.text("Cadastre seu veículo"), spacing="2"),
+                        rx.vstack(
+                            rx.text(AppState.user_full_name, class_name="profile-summary-name"),
+                            rx.text(AppState.user_email, class_name="profile-summary-email"),
+                            align="start",
+                            spacing="1",
+                        ),
+                        rx.vstack(
+                            rx.hstack(
+                                rx.text("Perfil completo"),
+                                rx.text(f"{profile_completion}%"),
+                                justify="between",
+                                width="100%",
+                                class_name="profile-completion-label",
+                            ),
+                            rx.box(
+                                rx.box(
+                                    class_name="profile-completion-fill",
+                                    style={"width": f"{profile_completion}%"},
+                                ),
+                                class_name="profile-completion-track",
+                            ),
+                            width="100%",
+                            spacing="2",
+                        ),
+                        rx.vstack(
+                            rx.hstack(
+                                rx.cond(
+                                    AppState.profile_has_photo,
+                                    rx.icon("check", size=16, class_name="profile-check done"),
+                                    rx.icon("circle", size=16, class_name="profile-check pending"),
+                                ),
+                                rx.text("Adicionar uma foto"),
+                                spacing="2",
+                                align="center",
+                            ),
+                            rx.hstack(
+                                rx.cond(
+                                    AppState.profile_has_name,
+                                    rx.icon("check", size=16, class_name="profile-check done"),
+                                    rx.icon("circle", size=16, class_name="profile-check pending"),
+                                ),
+                                rx.text("Informe seu nome"),
+                                spacing="2",
+                                align="center",
+                            ),
+                            rx.hstack(
+                                rx.cond(
+                                    AppState.profile_has_valid_cpf,
+                                    rx.icon("check", size=16, class_name="profile-check done"),
+                                    rx.icon("circle", size=16, class_name="profile-check pending"),
+                                ),
+                                rx.text("Informe um CPF válido"),
+                                spacing="2",
+                                align="center",
+                            ),
+                            rx.hstack(
+                                rx.cond(
+                                    AppState.profile_has_valid_phone,
+                                    rx.icon("check", size=16, class_name="profile-check done"),
+                                    rx.icon("circle", size=16, class_name="profile-check pending"),
+                                ),
+                                rx.text("Informe seu telefone"),
+                                spacing="2",
+                                align="center",
+                            ),
+                            rx.cond(
+                                AppState.user_role != "prestador",
+                                rx.hstack(
+                                    rx.cond(
+                                        OperationalState.has_profile_vehicles,
+                                        rx.icon("check", size=16, class_name="profile-check done"),
+                                        rx.icon("circle", size=16, class_name="profile-check pending"),
+                                    ),
+                                    rx.text("Cadastre seu veículo"),
+                                    spacing="2",
+                                    align="center",
+                                ),
+                            ),
+                            align="start",
+                            spacing="2",
+                            class_name="profile-checklist",
+                        ),
                         align="start",
-                        spacing="1",
-                        class_name="profile-checklist",
+                        spacing="4",
+                        class_name="profile-summary-details",
                     ),
                     align="center",
-                    spacing="3",
-                    margin_bottom="2rem",
+                    spacing="5",
                     class_name="profile-summary-card",
                 ),
                 # Basic Info
                 rx.vstack(
-                    rx.text("Informações básicas", weight="bold", size="5", color=COLORS["navy"]),
+                    rx.hstack(
+                        rx.icon("file-text", size=20, class_name="profile-section-icon"),
+                        rx.text("Informações básicas", weight="bold", size="5", color=COLORS["navy"]),
+                        align="center",
+                        spacing="2",
+                    ),
                     rx.text("Use os mesmos dados do seu documento.", class_name="profile-section-subtitle"),
                     rx.vstack(
                         rx.text("Nome", class_name="field-label"),
-                        rx.input(
-                            value=AppState.user_full_name,
-                            on_change=AppState.set_user_full_name,
-                            class_name="profile-input",
-                            width="100%",
-                            height="3.25rem",
-                            padding="0 1rem",
-                            border_radius="14px",
-                            border=f"1px solid {COLORS['line']}",
+                        rx.hstack(
+                            rx.icon("user-round", size=17, class_name="profile-input-icon"),
+                            rx.input(
+                                value=AppState.user_full_name,
+                                on_change=AppState.set_user_full_name,
+                                placeholder="Digite seu nome completo",
+                                color="#000000",
+                                _placeholder={"color": "#4B5563", "opacity": 0.8},
+                                class_name="profile-input-control",
+                                width="100%",
+                                height="100%",
+                            ),
+                            align="center",
+                            spacing="3",
+                            class_name="profile-input-wrap",
                         ),
                         width="100%",
-                        spacing="2",
+                        spacing="1",
                         align="start",
                     ),
                     rx.hstack(
                         rx.vstack(
                             rx.text("CPF", class_name="field-label"),
-                            rx.input(
-                                value=AppState.user_cpf,
-                                on_change=AppState.set_user_cpf,
-                                placeholder="000.000.000-00",
-                                class_name="profile-input",
-                                width="100%",
-                                height="3.25rem",
-                                padding="0 1rem",
-                                border_radius="14px",
-                                border=f"1px solid {COLORS['line']}",
-                                background="#F1F5F9",
-                                color=COLORS["text"],
+                            rx.hstack(
+                                rx.icon("id-card", size=17, class_name="profile-input-icon"),
+                                rx.input(
+                                    value=AppState.user_cpf,
+                                    on_change=AppState.set_user_cpf,
+                                    placeholder="000.000.000-00",
+                                    color="#000000",
+                                    _placeholder={"color": "#4B5563", "opacity": 0.8},
+                                    class_name="profile-input-control",
+                                    width="100%",
+                                    height="100%",
+                                ),
+                                align="center",
+                                spacing="3",
+                                class_name="profile-input-wrap",
                             ),
                             width="100%",
-                            spacing="2",
+                            spacing="1",
                             align="start",
                         ),
                         rx.vstack(
                             rx.text("Telefone com DDD", class_name="field-label"),
-                            rx.input(
-                                value=AppState.user_phone,
-                                on_change=AppState.set_user_phone,
-                                placeholder="(11) 90000-0000",
-                                class_name="profile-input",
-                                width="100%",
-                                height="3.25rem",
-                                padding="0 1rem",
-                                border_radius="14px",
-                                border=f"1px solid {COLORS['line']}",
+                            rx.hstack(
+                                rx.icon("phone", size=17, class_name="profile-input-icon"),
+                                rx.input(
+                                    value=AppState.user_phone,
+                                    on_change=AppState.set_user_phone,
+                                    placeholder="(11) 90000-0000",
+                                    color="#000000",
+                                    _placeholder={"color": "#4B5563", "opacity": 0.8},
+                                    class_name="profile-input-control",
+                                    width="100%",
+                                    height="100%",
+                                ),
+                                align="center",
+                                spacing="3",
+                                class_name="profile-input-wrap",
                             ),
                             width="100%",
-                            spacing="2",
+                            spacing="1",
                             align="start",
                         ),
                         width="100%",
                         spacing="3",
+                        class_name="profile-fields-row",
                     ),
                     rx.vstack(
                         rx.text("Email", class_name="field-label"),
-                        rx.input(
-                            value=AppState.user_email,
-                            class_name="profile-input",
-                            disabled=True,
-                            width="100%",
-                            height="3.25rem",
-                            padding="0 1rem",
-                            border_radius="14px",
-                            border=f"1px solid {COLORS['line']}",
+                        rx.hstack(
+                            rx.icon("mail", size=17, class_name="profile-input-icon"),
+                            rx.input(
+                                value=AppState.user_email,
+                                placeholder="E-mail cadastrado",
+                                color="#000000",
+                                _placeholder={"color": "#4B5563", "opacity": 0.8},
+                                class_name="profile-input-control",
+                                disabled=True,
+                                width="100%",
+                                height="100%",
+                            ),
+                            align="center",
+                            spacing="3",
+                            class_name="profile-input-wrap is-readonly",
                         ),
                         width="100%",
-                        spacing="2",
+                        spacing="1",
                         align="start",
                     ),
-                    rx.text(
-                        "O e-mail é o seu login e não pode ser alterado aqui.",
-                        class_name="profile-email-help",
+                    rx.hstack(
+                        rx.icon("circle", size=14, class_name="profile-email-radio"),
+                        rx.text(
+                            "O e-mail é o seu login e não pode ser alterado aqui.",
+                            class_name="profile-email-help",
+                        ),
+                        align="center",
+                        spacing="2",
                     ),
                     spacing="3",
                     class_name="profile-info-section",
@@ -3646,43 +4479,70 @@ def profile_screen() -> rx.Component:
                         align="start",
                     ),
                 ),
-                # Vehicles Section
-                rx.vstack(
-                    rx.hstack(
-                        rx.vstack(
-                            rx.text("Meus Veículos", weight="bold", size="4", color=COLORS["navy"]),
-                            rx.text("Seus veículos cadastrados", font_size="0.8rem", color=COLORS["text"]),
-                            align="start",
-                            spacing="0",
-                        ),
-                        rx.spacer(),
-                        rx.button(
-                            "Adicionar veículo",
-                            on_click=OperationalState.open_new_vehicle_modal,
-                            class_name="secondary-button",
-                            size="1",
-                        ),
-                        width="100%",
-                        align="center",
-                        justify="center",
-                        margin_bottom="1rem",
-                    ),
+                rx.cond(
+                    AppState.user_role != "prestador",
                     rx.vstack(
-                        rx.foreach(
-                            OperationalState.user_vehicles,
-                            lambda v: vehicle_card(v),
+                        rx.hstack(
+                            rx.vstack(
+                                rx.hstack(
+                                    rx.icon("car-front", size=20, class_name="profile-section-icon"),
+                                    rx.text("Meus veículos", weight="bold", size="4", color=COLORS["navy"]),
+                                    align="center",
+                                    spacing="2",
+                                ),
+                                rx.text(
+                                    "Seus veículos cadastrados",
+                                    font_size="0.8rem",
+                                    color=COLORS["text"],
+                                    class_name="profile-section-subtitle",
+                                ),
+                                align="start",
+                                spacing="1",
+                            ),
+                            rx.spacer(),
+                            rx.button(
+                                rx.hstack(
+                                    rx.icon("car-front", size=16),
+                                    rx.icon("plus", size=14),
+                                    rx.text("Adicionar veículo"),
+                                    align="center",
+                                    spacing="2",
+                                ),
+                                on_click=OperationalState.open_new_vehicle_modal,
+                                class_name="profile-add-vehicle-button",
+                                size="2",
+                            ),
+                            width="100%",
+                            align="center",
+                            justify="between",
+                            class_name="profile-vehicles-header",
                         ),
-                        width="100%",
+                        rx.vstack(
+                            rx.foreach(
+                                OperationalState.user_vehicles,
+                                lambda v: vehicle_card(v),
+                            ),
+                            width="100%",
+                            spacing="4",
+                            align="start",
+                            class_name="profile-vehicle-list",
+                        ),
                         spacing="3",
+                        class_name="profile-vehicles-section",
+                        width="100%",
                         align="start",
                     ),
-                    spacing="3",
-                    class_name="profile-vehicles-section",
-                    width="100%",
-                    align="start",
                 ),
                 rx.box(
-                    rx.text("Você tem alterações não salvas.", class_name="profile-unsaved-text"),
+                    rx.hstack(
+                        rx.icon("circle-alert", size=18, class_name="profile-unsaved-icon"),
+                        rx.text(
+                            "Você tem alterações não salvas.",
+                            class_name="profile-unsaved-text",
+                        ),
+                        align="center",
+                        spacing="2",
+                    ),
                     rx.button(
                         rx.cond(AppState.profile_is_loading, "Salvando...", "Salvar alterações"),
                         on_click=AppState.save_profile,
@@ -3716,7 +4576,7 @@ def profile_screen() -> rx.Component:
             vehicle_modal(),
         ),
         on_mount=[AuthState.load_profile, OperationalState.load_user_vehicles],
-        background=COLORS["background"],
+        background="#F4F7F9",
         width="100%",
         min_height="100vh",
         class_name="profile-page",
@@ -3969,6 +4829,7 @@ def provider_home_screen() -> rx.Component:
                 spacing="2",
                 align="center",
             ),
+            rx.box(class_name="provider-header-divider"),
             rx.vstack(
                 rx.text("Área do prestador", weight="bold", color=COLORS["navy"]),
                 rx.text(
@@ -3985,13 +4846,17 @@ def provider_home_screen() -> rx.Component:
                     rx.text(
                         rx.cond(OperationalState.is_available, "Disponível", "Indisponível"),
                         weight="bold",
-                        color=rx.cond(OperationalState.is_available, "#047857", "#475569"),
+                        color="white",
                     ),
                     rx.box(
                         rx.box(
                             class_name="provider-toggle-knob",
                         ),
-                        class_name="provider-toggle-track",
+                        class_name=rx.cond(
+                            OperationalState.is_available,
+                            "provider-toggle-track available",
+                            "provider-toggle-track unavailable",
+                        ),
                     ),
                     spacing="2",
                     align="center",
@@ -4002,20 +4867,20 @@ def provider_home_screen() -> rx.Component:
                     "Disponível para chamados. Ative para ficar indisponível.",
                     "Indisponível para chamados. Ative para ficar disponível.",
                 ),
-                class_name="provider-availability-toggle",
+                class_name=rx.cond(
+                    OperationalState.is_available,
+                    "provider-availability-toggle available",
+                    "provider-availability-toggle unavailable",
+                ),
                 type="button",
             ),
-            profile_avatar(),
-            position="fixed",
-            top="0",
-            left="0",
-            right="0",
-            z_index="3000",
+            rx.box(
+                profile_avatar(),
+                class_name="provider-home-avatar-shell",
+            ),
             align="center",
-            padding="0.75rem 1.5rem",
-            background="white",
-            border_bottom=f"1px solid {COLORS['line']}",
-            box_shadow="0 1px 5px rgba(15,23,42,0.04)",
+            justify="between",
+            width="100%",
             class_name="provider-home-header",
         ),
         # Main Body
@@ -4023,46 +4888,55 @@ def provider_home_screen() -> rx.Component:
             # Map
             rx.box(
                 rx.box(
-                    id="provider-home-map",
-                    position="absolute",
-                    top="0",
-                    right="0",
-                    bottom="0",
-                    left="0",
-                    on_mount=[
-                        rx.call_script(
-                            "window.initSOSMap('provider-home-map', [-23.5505, -46.6333], 13);"
+                    rx.box(
+                        id="provider-home-map",
+                        position="absolute",
+                        top="0",
+                        right="0",
+                        bottom="0",
+                        left="0",
+                        on_mount=[
+                            rx.call_script(
+                                "window.initSOSMap('provider-home-map', [-23.5505, -46.6333], 13);"
+                            ),
+                            rx.call_script(
+                                "window.requestProviderMapLocation('provider-home-map');"
+                            ),
+                        ],
+                    ),
+                    rx.button(
+                        rx.hstack(
+                            rx.icon("locate-fixed", size=16),
+                            rx.text("Centralizar no meu local"),
+                            align="center",
+                            spacing="2",
                         ),
-                        rx.call_script(
+                        on_click=rx.call_script(
                             "window.requestProviderMapLocation('provider-home-map');"
                         ),
-                    ],
-                ),
-                rx.button(
-                    "Centralizar no meu local",
-                    on_click=rx.call_script(
-                        "window.requestProviderMapLocation('provider-home-map');"
+                        aria_label="Centralizar o mapa na minha localização atual",
+                        position="absolute",
+                        top="0.75rem",
+                        right="0.75rem",
+                        z_index="1000",
+                        class_name="provider-recenter-button",
+                        type="button",
                     ),
-                    aria_label="Centralizar o mapa na minha localização atual",
-                    position="fixed",
-                    top="5rem",
-                    right="31.5%",
-                    z_index="2000",
-                    class_name="provider-recenter-button",
-                    type="button",
+                    rx.text(
+                        "",
+                        id="provider-location-status",
+                        role="status",
+                        aria_live="polite",
+                        display="none",
+                        position="absolute",
+                    ),
+                    width="100%",
+                    height="100%",
+                    position="relative",
+                    overflow="hidden",
+                    class_name="provider-map-frame",
                 ),
-                rx.text(
-                    "",
-                    id="provider-location-status",
-                    role="status",
-                    aria_live="polite",
-                    display="none",
-                    position="absolute",
-                ),
-                width="70%",
-                height="100%",
-                position="relative",
-                overflow="hidden",
+                padding="12px",
                 class_name="provider-map-pane",
             ),
             # Requests panel
@@ -4074,7 +4948,28 @@ def provider_home_screen() -> rx.Component:
                         class_name="provider-requests-subtitle",
                     ),
                     rx.cond(
-                        OperationalState.is_available,
+                        (OperationalState.pending_requests_error != "")
+                        & OperationalState.has_available_requests,
+                        rx.vstack(
+                            rx.text(
+                                OperationalState.pending_requests_error,
+                                color=COLORS["muted"],
+                            ),
+                            rx.button(
+                                "Tentar novamente",
+                                on_click=OperationalState.load_pending_requests,
+                                class_name="secondary-button",
+                            ),
+                            align="start",
+                            spacing="2",
+                            width="100%",
+                        ),
+                        rx.box(),
+                    ),
+                    rx.cond(
+                        OperationalState.is_available
+                        | OperationalState.has_active_requests
+                        | (OperationalState.pending_requests_error != ""),
                         rx.cond(
                             OperationalState.pending_requests_loading
                             & ~OperationalState.has_available_requests,
@@ -4089,7 +4984,8 @@ def provider_home_screen() -> rx.Component:
                                 min_height="12rem",
                             ),
                             rx.cond(
-                                OperationalState.pending_requests_error != "",
+                                (OperationalState.pending_requests_error != "")
+                                & ~OperationalState.has_available_requests,
                                 rx.center(
                                     rx.vstack(
                                         rx.text(OperationalState.pending_requests_error, color=COLORS["muted"]),
@@ -4108,15 +5004,28 @@ def provider_home_screen() -> rx.Component:
                                     OperationalState.has_available_requests,
                                     rx.vstack(
                                         rx.foreach(
-                                            OperationalState.available_requests,
+                                            OperationalState.provider_home_requests,
                                             lambda request: rx.vstack(
                                                 rx.hstack(
-                                                    rx.text(request["type"], weight="bold", color=COLORS["navy"]),
+                                                    rx.hstack(
+                                                        rx.box(
+                                                            rx.icon("wrench", size=18),
+                                                            class_name="provider-request-icon",
+                                                        ),
+                                                        rx.text(
+                                                            request["type"],
+                                                            weight="bold",
+                                                            color=COLORS["navy"],
+                                                        ),
+                                                        align="center",
+                                                        spacing="2",
+                                                    ),
                                                     rx.spacer(),
                                                     rx.text(
                                                         request["distance"],
                                                         class_name="provider-request-distance",
                                                     ),
+                                                    align="center",
                                                     width="100%",
                                                 ),
                                                 rx.text(
@@ -4124,12 +5033,26 @@ def provider_home_screen() -> rx.Component:
                                                     class_name="provider-request-description",
                                                 ),
                                                 rx.cond(
-                                                    request["type"] == "Troca de Pneu",
-                                                    rx.button(
-                                                        "Aceitar chamado",
-                                                        on_click=lambda: OperationalState.accept_request(request["id"]),
-                                                        class_name="provider-request-action accept",
-                                                        type="button",
+                                                    request["is_active"],
+                                                    rx.hstack(
+                                                        rx.button(
+                                                            "Ver detalhes",
+                                                            on_click=lambda: OperationalState.view_request_details(request["id"]),
+                                                            class_name="provider-request-action details",
+                                                            flex="1",
+                                                            type="button",
+                                                        ),
+                                                        rx.hstack(
+                                                            rx.box(class_name="provider-request-active-dot"),
+                                                            rx.text("Em andamento"),
+                                                            align="center",
+                                                            spacing="2",
+                                                            class_name="provider-request-active-badge",
+                                                        ),
+                                                        align="center",
+                                                        spacing="3",
+                                                        width="100%",
+                                                        class_name="provider-request-action-row",
                                                     ),
                                                     rx.button(
                                                         "Ver detalhes",
@@ -4140,7 +5063,11 @@ def provider_home_screen() -> rx.Component:
                                                 ),
                                                 width="100%",
                                                 spacing="2",
-                                                class_name="provider-request-card",
+                                                class_name=rx.cond(
+                                                    request["is_active"],
+                                                    "provider-request-card provider-request-card-active",
+                                                    "provider-request-card",
+                                                ),
                                             ),
                                         ),
                                         width="100%",
@@ -4181,24 +5108,23 @@ def provider_home_screen() -> rx.Component:
                     width="100%",
                     spacing="1",
                 ),
-                width="30%",
-                height="100%",
+                width="100%",
+                height="auto",
                 padding="1.25rem 1.5rem",
                 background="white",
-                overflow_y="auto",
                 class_name="provider-requests-pane",
             ),
             width="100%",
-            height="100vh",
-            padding_top="4rem",
-            spacing="0",
+            height="auto",
+            align="start",
+            spacing="4",
             class_name="provider-home-body",
         ),
         on_mount=[
             OperationalState.reset_provider_home,
+            OperationalState.load_pending_requests,
             OperationalState.poll_pending_requests,
         ],
-        background="white",
         width="100%",
         min_height="100vh",
         class_name="provider-home-page",
@@ -4213,13 +5139,19 @@ def service_details_screen() -> rx.Component:
                 rx.button(
                     "← Voltar",
                     on_click=rx.redirect("/home_provider"),
-                    class_name="secondary-button",
+                    class_name="service-details-back",
                     size="1",
                 ),
-                rx.heading("Detalhes do Atendimento", size="6", color=COLORS["navy"]),
+                rx.heading(
+                    "Detalhes do Atendimento",
+                    size="6",
+                    color=COLORS["navy"],
+                    class_name="service-details-title",
+                ),
                 align="center",
                 spacing="4",
                 width="100%",
+                class_name="service-details-header",
             ),
             rx.grid(
                 rx.vstack(
@@ -4227,33 +5159,58 @@ def service_details_screen() -> rx.Component:
                         rx.box(
                             rx.text(
                                 OperationalState.selected_request["service_icon"],
-                                font_size="2rem",
-                                color=COLORS["emergency_orange"],
+                                class_name="service-details-category-symbol",
                             ),
-                            width="4rem",
-                            height="4rem",
-                            display="flex",
-                            align_items="center",
-                            justify_content="center",
-                            background="#FFF7ED",
-                            border_radius="16px",
+                            class_name="service-details-category-icon",
                         ),
                         rx.vstack(
-                            rx.text(OperationalState.selected_request["type"], weight="bold", size="5", color=COLORS["navy"]),
-                            rx.text("Solicitação de atendimento", color=COLORS["muted"]),
+                            rx.text(
+                                OperationalState.selected_request["type"],
+                                weight="bold",
+                                size="5",
+                                color=COLORS["navy"],
+                                class_name="service-details-category-name",
+                            ),
+                            rx.text(
+                                "Solicitação de atendimento",
+                                color=COLORS["muted"],
+                                class_name="service-details-category-caption",
+                            ),
                             align="start",
                             spacing="1",
+                            class_name="service-details-category-copy",
                         ),
                         align="center",
-                        spacing="4",
+                        spacing="3",
+                        class_name="service-details-category",
                     ),
                     rx.vstack(
-                        rx.text("Cliente", class_name="field-label"),
-                        rx.text(OperationalState.selected_request["user"], size="5", weight="bold", color=COLORS["navy"]),
-                        rx.text(OperationalState.selected_request["address"], color=COLORS["text"]),
-                        rx.text(f"Distância: {OperationalState.selected_request['distance']}", color=COLORS["muted"]),
+                        rx.text("Cliente", class_name="field-label service-details-label"),
+                        rx.text(
+                            OperationalState.selected_request["user"],
+                            size="6",
+                            weight="bold",
+                            color=COLORS["navy"],
+                            class_name="service-details-client-name",
+                        ),
+                        rx.hstack(
+                            rx.icon("map-pin", size=16),
+                            rx.text(
+                                OperationalState.selected_request["address"],
+                                class_name="service-details-address-text",
+                            ),
+                            align="center",
+                            spacing="2",
+                            class_name="service-details-address",
+                        ),
+                        rx.text(
+                            f"Distância: {OperationalState.selected_request['distance']}",
+                            color=COLORS["muted"],
+                            class_name="service-details-distance",
+                        ),
                         align="start",
-                        spacing="2",
+                        spacing="3",
+                        class_name="service-details-customer",
                     ),
                     rx.hstack(
                         rx.link(
@@ -4270,7 +5227,7 @@ def service_details_screen() -> rx.Component:
                             f"tel:{OperationalState.selected_request['phone']}",
                             "#",
                         ),
-                        class_name="primary-button action-button",
+                        class_name="service-details-call-button action-button",
                         width="auto",
                         padding_x="1.25rem",
                     ),
@@ -4283,50 +5240,93 @@ def service_details_screen() -> rx.Component:
                             align="center",
                             spacing="2",
                         ),
-                        class_name="secondary-button action-button",
+                        class_name="service-details-message-button action-button",
                         width="auto",
                         padding_x="1.25rem",
                     ),
                     spacing="3",
                     width="100%",
+                    class_name="service-details-contact-actions",
                     ),
                     rx.vstack(
-                        rx.text("Status do atendimento", class_name="field-label"),
-                        rx.text("A caminho", color=COLORS["emergency_orange"], weight="bold"),
-                        rx.hstack(
-                            rx.button(
-                                rx.hstack(rx.text("📍"), rx.text("Cheguei"), width="100%", justify="center", spacing="2"),
-                                class_name="secondary-button action-button",
-                                size="1",
-                                width="auto",
-                                padding_x="1rem",
-                            ),
-                            rx.button(
-                                rx.hstack(rx.text("✓"), rx.text("Concluído"), width="100%", justify="center", spacing="2"),
-                                class_name="secondary-button action-button",
-                                size="1",
-                                width="auto",
-                                padding_x="1rem",
-                            ),
-                            spacing="3",
+                        rx.text(
+                            "Status do atendimento",
+                            class_name="field-label service-details-label",
+                        ),
+                        rx.text(
+                            "A caminho",
+                            color=COLORS["emergency_orange"],
+                            weight="bold",
+                            class_name="service-details-status-badge",
+                        ),
+                        rx.text(
+                            "Aceite o chamado para avançar pelas etapas até a conclusão.",
+                            class_name="service-details-flow-note",
                         ),
                         align="start",
                         spacing="2",
+                        class_name="service-details-status",
                     ),
-                    rx.link(
+                    rx.button(
                         rx.hstack(
-                            rx.text("➤"),
-                            rx.text("Como Chegar"),
+                            rx.icon("circle-check", size=18),
+                            rx.text("Aceitar chamado"),
                             width="100%",
                             justify="center",
                             align="center",
                             spacing="2",
                         ),
-                        href=OperationalState.selected_request["maps_url"],
-                        is_external=True,
-                        class_name="primary-button action-button",
-                        width="auto",
-                        padding_x="1.5rem",
+                        on_click=lambda: OperationalState.accept_request(
+                            OperationalState.selected_request["id"]
+                        ),
+                        class_name="service-details-accept-button action-button",
+                        type="button",
+                    ),
+                    rx.cond(
+                        OperationalState.selected_request["maps_url"] != "",
+                        rx.link(
+                            rx.hstack(
+                                rx.text("➤"),
+                                rx.text("Como Chegar"),
+                                width="100%",
+                                justify="center",
+                                align="center",
+                                spacing="2",
+                            ),
+                            href=OperationalState.selected_request["maps_url"],
+                            is_external=True,
+                            class_name="primary-button action-button service-details-route-button",
+                            width="auto",
+                            padding_x="1.5rem",
+                        ),
+                        rx.text(
+                            "Localização indisponível para este chamado.",
+                            color=COLORS["muted"],
+                        ),
+                    ),
+                    rx.button(
+                        rx.hstack(
+                            rx.cond(
+                                OperationalState.is_ending_request,
+                                rx.spinner(size="1"),
+                                rx.icon("circle-check", size=18),
+                            ),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.is_ending_request,
+                                    "Encerrando chamado...",
+                                    "Encerrar chamado",
+                                )
+                            ),
+                            width="100%",
+                            justify="center",
+                            align="center",
+                            spacing="2",
+                        ),
+                        on_click=OperationalState.encerrar_chamado,
+                        disabled=OperationalState.is_ending_request,
+                        class_name="service-end-button action-button",
+                        type="button",
                     ),
                     rx.button(
                         rx.hstack(
@@ -4338,13 +5338,13 @@ def service_details_screen() -> rx.Component:
                             spacing="2",
                         ),
                         on_click=rx.redirect("/home_provider"),
-                        class_name="secondary-button action-button",
+                        class_name="service-details-cancel-button action-button",
                         width="auto",
                         padding_x="1.5rem",
                     ),
-                    class_name="op-card",
+                    class_name="service-details-card",
                     align="start",
-                    spacing="5",
+                    spacing="4",
                     width="100%",
                 ),
                 rx.box(
@@ -4355,25 +5355,22 @@ def service_details_screen() -> rx.Component:
                         on_mount=rx.call_script(
                             "window.initSOSMap('service-details-map', [-23.5614, -46.6559], 14);"
                         ),
+                        class_name="service-details-map",
                     ),
-                    width="100%",
-                    height=["50vh", "50vh", "70vh"],
-                    border_radius="20px",
-                    overflow="hidden",
+                    class_name="service-details-map-card",
                 ),
-                columns="1",
                 class_name="service-details-grid",
-                spacing="6",
+                spacing="4",
                 width="100%",
             ),
             width="100%",
-            max_width="1200px",
-            padding=["1rem", "2rem", "3rem"],
+            max_width="1440px",
             spacing="6",
+            class_name="service-details-content",
         ),
         width="100%",
         min_height="100vh",
-        background=COLORS["background"],
+        class_name="service-details-page",
     )
 
 
@@ -4392,7 +5389,7 @@ def provider_service_progress_screen() -> rx.Component:
         ),
         rx.hstack(
             rx.button(
-                "← Home",
+                "← Área do prestador",
                 on_click=rx.redirect("/home_provider"),
                 class_name="secondary-button",
                 size="1",
@@ -4565,6 +5562,30 @@ def provider_service_progress_screen() -> rx.Component:
                         size="3",
                         font_weight="bold",
                     ),
+                    rx.button(
+                        rx.hstack(
+                            rx.cond(
+                                OperationalState.is_ending_request,
+                                rx.spinner(size="1"),
+                                rx.icon("circle-check", size=18),
+                            ),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.is_ending_request,
+                                    "Encerrando chamado...",
+                                    "Encerrar chamado",
+                                )
+                            ),
+                            width="100%",
+                            justify="center",
+                            align="center",
+                            spacing="2",
+                        ),
+                        on_click=OperationalState.encerrar_chamado,
+                        disabled=OperationalState.is_ending_request,
+                        class_name="service-end-button action-button",
+                        type="button",
+                    ),
                     spacing="5",
                     width="100%",
                 ),
@@ -4733,7 +5754,7 @@ def service_message_panel() -> rx.Component:
             ),
             position="fixed",
             inset="0",
-            z_index="140",
+            z_index="2000",
             display="flex",
             align_items="center",
             justify_content="center",
@@ -4837,7 +5858,7 @@ def client_message_panel() -> rx.Component:
             ),
             position="fixed",
             inset="0",
-            z_index="140",
+            z_index="2000",
             display="flex",
             align_items="center",
             justify_content="center",

@@ -176,6 +176,11 @@ class TestServiceChat(unittest.TestCase):
     def test_both_chat_panels_build_with_accessible_sync_status(self):
         for panel in (service_message_panel(), client_message_panel()):
             components = list(walk_components(panel))
+            overlays = [
+                component
+                for component in components
+                if getattr(component, "position", None) == "fixed"
+            ]
             status_regions = [
                 component
                 for component in components
@@ -184,6 +189,8 @@ class TestServiceChat(unittest.TestCase):
             ]
             self.assertEqual(len(status_regions), 1)
             self.assertEqual(status_regions[0].custom_attrs.get("aria-live"), "polite")
+            self.assertEqual(len(overlays), 1)
+            self.assertEqual(getattr(overlays[0], "z_index", None), "2000")
             self.assertTrue(any(getattr(component, "tag", None) == "Button" for component in components))
 
 
