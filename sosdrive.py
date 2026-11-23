@@ -42,8 +42,11 @@ from supabase_backend import (
     send_service_message as send_service_message_supabase,
     sign_in as sign_in_supabase,
     sign_up as sign_up_supabase,
+    request_password_reset as request_password_reset_supabase,
+    update_password as update_password_supabase,
     upload_profile_photo as upload_profile_photo_supabase,
 )
+from supabase_config import get_supabase_settings
 
 from styles import GLOBAL_STYLE, COLORS
 
@@ -67,6 +70,8 @@ def validate_signup(name: str, email: str, password: str) -> str:
     """Return a local signup validation message, or an empty string."""
     if not all((name.strip(), email.strip(), password.strip())):
         return "Preencha nome, email e senha para continuar."
+    if len(password) < 6:
+        return "A senha deve ter pelo menos 6 caracteres."
     return ""
 
 
@@ -702,6 +707,17 @@ class AuthState(rx.State):
     error_message: str = ""
     signup_message: str = ""
     is_loading: bool = False
+    recovery_email: str = ""
+    recovery_message: str = ""
+    recovery_error: str = ""
+    recovery_password: str = ""
+    recovery_password_confirmation: str = ""
+    recovery_ready: bool = False
+    recovery_access_token: str = ""
+    recovery_refresh_token: str = ""
+    is_recovering_password: bool = False
+    recovery_success_message: str = ""
+    recovery_origin: str = ""
     active_call_status: str | None = None
     active_call_eta: str = "15 min"
 
@@ -749,6 +765,115 @@ class AuthState(rx.State):
 
     def open_login(self) -> None:
         return rx.redirect("/login")
+
+    def open_password_recovery(self) -> None:
+        return rx.redirect("/esqueci-senha")
+
+    def set_recovery_email(self, value: str) -> None:
+        self.recovery_email = value
+
+    def set_recovery_password(self, value: str) -> None:
+        self.recovery_password = value
+
+    def set_recovery_password_confirmation(self, value: str) -> None:
+        self.recovery_password_confirmation = value
+
+    def set_recovery_origin(self, value: str) -> None:
+        self.recovery_origin = value
+
+    def handle_recovery_origin(self, value: str) -> None:
+        self.recovery_origin = value
+
+    def clear_password_recovery_listener(self) -> None:
+        self.recovery_ready = False
+        self.recovery_access_token = ""
+        self.recovery_refresh_token = ""
+
+    @rx.event
+    async def send_password_recovery(self):
+        if self.is_loading:
+            return
+        self.recovery_message = ""
+        self.recovery_error = ""
+        email = (self.recovery_email or "").strip()
+        if not email:
+            self.recovery_error = "Informe seu e-mail."
+            return
+
+        self.is_loading = True
+        yield
+        try:
+            origin = (self.recovery_origin or "").strip()
+            if not origin:
+                redirect_url = os.getenv("SUPABASE_EMAIL_REDIRECT_URL", "").strip()
+                parsed_redirect = urlsplit(redirect_url)
+                origin = f"{parsed_redirect.scheme}://{parsed_redirect.netloc}"
+            await asyncio.to_thread(
+                request_password_reset_supabase,
+                email,
+                origin,
+            )
+            self.recovery_message = "Se esse e-mail estiver cadastrado, você receberá um link"
+        except SupabaseConfigurationRuntimeError:
+            self.recovery_error = "Não foi possível configurar o link de recuperação neste ambiente."
+        except SupabaseBackendError as error:
+            logger.error("Password recovery request failed status=%s", error.status_code)
+            self.recovery_error = "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
+        finally:
+            self.is_loading = False
+
+    @rx.event
+    def handle_password_recovery_event(self, event_payload: str):
+        if not event_payload:
+            return
+        try:
+            payload = json.loads(event_payload)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if payload.get("event") != "PASSWORD_RECOVERY":
+            return
+        self.recovery_ready = True
+        self.recovery_access_token = str(payload.get("access_token") or "")
+        self.recovery_refresh_token = str(payload.get("refresh_token") or "")
+
+    @rx.event
+    async def update_recovery_password(self):
+        if self.is_recovering_password:
+            return
+        self.recovery_error = ""
+        self.recovery_success_message = ""
+        password = self.recovery_password or ""
+        confirmation = self.recovery_password_confirmation or ""
+        if len(password) < 6:
+            self.recovery_error = "A nova senha deve ter pelo menos 6 caracteres."
+            return
+        if password != confirmation:
+            self.recovery_error = "As duas senhas precisam ser iguais."
+            return
+        if not self.recovery_access_token or not self.recovery_refresh_token:
+            self.recovery_error = "Esta página não possui uma sessão válida de recuperação."
+            return
+
+        self.is_recovering_password = True
+        yield
+        try:
+            await asyncio.to_thread(
+                update_password_supabase,
+                self.recovery_access_token,
+                self.recovery_refresh_token,
+                password,
+            )
+            self.recovery_success_message = "Senha redefinida com sucesso."
+            self.recovery_password = ""
+            self.recovery_password_confirmation = ""
+            yield rx.redirect("/login")
+        except SupabaseAuthenticationError:
+            self.recovery_error = "Não foi possível redefinir a senha. Abra novamente o link enviado por e-mail."
+        except SupabaseBackendError as error:
+            logger.error("Password update failed status=%s", error.status_code)
+            self.recovery_error = "Não foi possível redefinir a senha. Tente novamente."
+        finally:
+            self.is_recovering_password = False
 
     def choose_signup_role(self, role: str) -> None:
         if role in {"cliente", "prestador"}:
@@ -823,6 +948,12 @@ class AuthState(rx.State):
                 self.error_message = (
                     "O Supabase recusou o cadastro (HTTP 400). Confira o formato do e-mail, "
                     "a senha mínima e se cadastro por e-mail está habilitado nas configurações Auth."
+                )
+                logger.error("Supabase signup failed status=%s", error.status_code)
+            elif error.status_code == 422:
+                self.error_message = (
+                    "A senha não atende aos requisitos de segurança. "
+                    "Use pelo menos 6 caracteres."
                 )
                 logger.error("Supabase signup failed status=%s", error.status_code)
             elif error.status_code == 429:
@@ -2170,6 +2301,19 @@ class OperationalState(rx.State):
         """Start a service request through Supabase."""
         return await self._submit_customer_request(service_type)
 
+    def select_customer_service(self, service_type: str):
+        """Select a service without changing the existing request flow."""
+        self.selected_service = service_type
+        self.request_error_message = ""
+
+    @rx.event
+    async def submit_selected_customer_request(self):
+        """Submit the service selected in the client home."""
+        if not self.selected_service:
+            self.request_error_message = "Escolha um tipo de socorro para continuar."
+            return rx.toast(self.request_error_message)
+        return await self._submit_customer_request(self.selected_service)
+
     async def _submit_customer_request(self, service_type: str):
         """Validate request inputs and create the Supabase service request."""
         self.request_error_message = ""
@@ -2586,6 +2730,333 @@ def resend_confirmation_controls() -> rx.Component:
     )
 
 
+def forgot_password_screen() -> rx.Component:
+    return rx.box(
+        rx.box(
+            rx.hstack(
+                rx.box("✦", class_name="login-brand-mark"),
+                rx.text("SOS Drive", class_name="login-brand-name"),
+                spacing="2",
+                align="center",
+            ),
+            rx.vstack(
+                rx.heading("Esqueci minha senha", class_name="login-title", size="8"),
+                rx.text(
+                    "Informe seu e-mail para receber o link de recuperação.",
+                    class_name="login-subtitle",
+                ),
+                rx.form(
+                    rx.vstack(
+                        text_input(
+                            "E-mail",
+                            "voce@email.com",
+                            AppState.recovery_email,
+                            AppState.set_recovery_email,
+                        ),
+                        rx.button(
+                            rx.cond(AppState.is_loading, "Enviando...", "Enviar link de recuperação"),
+                            type="submit",
+                            class_name="login-submit",
+                            width="100%",
+                            disabled=AppState.is_loading,
+                        ),
+                        rx.cond(
+                            AppState.recovery_message != "",
+                            rx.text(AppState.recovery_message, class_name="success-message"),
+                        ),
+                        rx.cond(
+                            AppState.recovery_error != "",
+                            rx.text(AppState.recovery_error, class_name="error-message"),
+                        ),
+                        width="100%",
+                        spacing="4",
+                    ),
+                    on_submit=AppState.send_password_recovery,
+                    width="100%",
+                ),
+                rx.hstack(
+                    rx.button(
+                        "Voltar para o login",
+                        on_click=AppState.open_login,
+                        class_name="login-inline-link",
+                        type="button",
+                    ),
+                    rx.spacer(),
+                    width="100%",
+                    align="center",
+                ),
+                width="min(100%, 26rem)",
+                spacing="5",
+                class_name="login-form-content",
+            ),
+            rx.input(
+                value=AppState.recovery_origin,
+                on_change=AppState.set_recovery_origin,
+                id="recovery-origin-trigger",
+                display="none",
+            ),
+            on_mount=rx.call_script(
+                """
+                (() => {
+                    const input = document.getElementById('recovery-origin-trigger');
+                    if (!input) return;
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype,
+                        'value'
+                    ).set;
+                    setter.call(input, window.location.origin);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                })();
+                """
+            ),
+            class_name="login-form-panel",
+        ),
+        rx.box(
+            rx.box(class_name="login-stars"),
+            rx.box(class_name="login-moon"),
+            rx.box(
+                rx.box(class_name="login-road-centerline"),
+                rx.box(class_name="login-road-edge"),
+            ),
+            rx.vstack(
+                rx.heading("Recupere seu\nacesso.", class_name="login-visual-title", size="8"),
+                rx.text(
+                    "Use o link enviado por e-mail para criar uma nova senha.",
+                    class_name="login-visual-copy",
+                ),
+                align="start",
+                spacing="3",
+                class_name="login-visual-copy-block",
+            ),
+            class_name="login-visual-panel",
+        ),
+        class_name="login-page",
+    )
+
+
+def reset_password_screen() -> rx.Component:
+    settings = get_supabase_settings()
+    recovery_listener_script = f"""
+    (() => {{
+        let attempts = 0;
+        const notifyRecovery = (session) => {{
+            if (!session?.access_token || !session?.refresh_token) return;
+            const input = document.getElementById('recovery-event-trigger');
+            if (!input) return;
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+            setter.call(input, JSON.stringify({{
+                event: 'PASSWORD_RECOVERY',
+                access_token: session.access_token,
+                refresh_token: session.refresh_token
+            }}));
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        }};
+        const initialize = () => {{
+            if (!window.supabase) {{
+                attempts += 1;
+                if (attempts < 100) window.setTimeout(initialize, 50);
+                return;
+            }}
+            window.sosRecoveryClient = window.supabase.createClient(
+                {json.dumps(settings.url)},
+                {json.dumps(settings.anon_key)}
+            );
+            window.sosRecoverySubscription = window.sosRecoveryClient.auth.onAuthStateChange(
+                (event, session) => {{
+                    if (event !== 'PASSWORD_RECOVERY') return;
+                    notifyRecovery(session);
+                }}
+            );
+
+            (async () => {{
+                const url = new URL(window.location.href);
+                const code = url.searchParams.get('code');
+                if (code) {{
+                    try {{
+                        const result = await window.sosRecoveryClient.auth.exchangeCodeForSession(code);
+                        notifyRecovery(result.data?.session);
+                    }} catch (error) {{
+                        console.error('Não foi possível processar o código de recuperação.');
+                    }}
+                    return;
+                }}
+
+                const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+                const type = hashParams.get('type');
+                const accessToken = hashParams.get('access_token');
+                const refreshToken = hashParams.get('refresh_token');
+                if (type === 'recovery' && accessToken && refreshToken) {{
+                    try {{
+                        const result = await window.sosRecoveryClient.auth.setSession(
+                            accessToken,
+                            refreshToken
+                        );
+                        notifyRecovery(result.data?.session);
+                    }} catch (error) {{
+                        console.error('Não foi possível processar o link de recuperação.');
+                    }}
+                }}
+            }})();
+        }};
+        initialize();
+    }})();
+    """
+    return rx.box(
+        rx.box(
+            rx.hstack(
+                rx.box("✦", class_name="login-brand-mark"),
+                rx.text("SOS Drive", class_name="login-brand-name"),
+                spacing="2",
+                align="center",
+            ),
+            rx.vstack(
+                rx.heading("Redefinir senha", class_name="login-title", size="8"),
+                rx.cond(
+                    AppState.recovery_ready,
+                    rx.vstack(
+                        rx.text(
+                            "Escolha uma nova senha para acessar sua conta.",
+                            class_name="login-subtitle",
+                        ),
+                        rx.form(
+                            rx.vstack(
+                                rx.vstack(
+                                    rx.text("Nova senha", class_name="field-label"),
+                                    rx.input(
+                                        type="password",
+                                        placeholder="Mínimo 6 caracteres",
+                                        value=AppState.recovery_password,
+                                        on_change=AppState.set_recovery_password,
+                                        width="100%",
+                                        height="3.25rem",
+                                        padding="0 1rem",
+                                        border_radius="10px",
+                                        border=f"1px solid {COLORS['line']}",
+                                        background="white",
+                                        color=COLORS["text"],
+                                    ),
+                                    width="100%",
+                                    spacing="2",
+                                ),
+                                rx.vstack(
+                                    rx.text("Confirmar senha", class_name="field-label"),
+                                    rx.input(
+                                        type="password",
+                                        placeholder="Repita a nova senha",
+                                        value=AppState.recovery_password_confirmation,
+                                        on_change=AppState.set_recovery_password_confirmation,
+                                        width="100%",
+                                        height="3.25rem",
+                                        padding="0 1rem",
+                                        border_radius="10px",
+                                        border=f"1px solid {COLORS['line']}",
+                                        background="white",
+                                        color=COLORS["text"],
+                                    ),
+                                    width="100%",
+                                    spacing="2",
+                                ),
+                                rx.button(
+                                    rx.cond(
+                                        AppState.is_recovering_password,
+                                        "Salvando...",
+                                        "Salvar nova senha",
+                                    ),
+                                    type="submit",
+                                    class_name="login-submit",
+                                    width="100%",
+                                    disabled=AppState.is_recovering_password,
+                                ),
+                                rx.cond(
+                                    AppState.recovery_error != "",
+                                    rx.text(AppState.recovery_error, class_name="error-message"),
+                                ),
+                                rx.cond(
+                                    AppState.recovery_success_message != "",
+                                    rx.text(
+                                        AppState.recovery_success_message,
+                                        class_name="success-message",
+                                    ),
+                                ),
+                                width="100%",
+                                spacing="4",
+                            ),
+                            on_submit=AppState.update_recovery_password,
+                            width="100%",
+                        ),
+                        width="100%",
+                        spacing="4",
+                    ),
+                    rx.vstack(
+                        rx.text(
+                            "Este link não é válido para redefinir senha ou a página foi aberta diretamente.",
+                            class_name="error-message",
+                        ),
+                        rx.link(
+                            "Solicitar outro link",
+                            href="/esqueci-senha",
+                            class_name="login-inline-link",
+                        ),
+                        rx.link(
+                            "Voltar para o login",
+                            href="/login",
+                            class_name="login-inline-link",
+                        ),
+                        width="100%",
+                        spacing="3",
+                    ),
+                ),
+                rx.input(
+                    value="",
+                    on_change=AppState.handle_password_recovery_event,
+                    id="recovery-event-trigger",
+                    display="none",
+                ),
+                rx.script(
+                    src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2",
+                    on_mount=[
+                        rx.call_script(recovery_listener_script),
+                    ],
+                    on_unmount=[
+                        rx.call_script(
+                            "window.sosRecoverySubscription?.unsubscribe(); "
+                            "window.sosRecoverySubscription = null;"
+                        ),
+                        AppState.clear_password_recovery_listener,
+                    ],
+                ),
+                width="min(100%, 26rem)",
+                spacing="5",
+                class_name="login-form-content",
+            ),
+            class_name="login-form-panel",
+        ),
+        rx.box(
+            rx.box(class_name="login-stars"),
+            rx.box(class_name="login-moon"),
+            rx.box(
+                rx.box(class_name="login-road-centerline"),
+                rx.box(class_name="login-road-edge"),
+            ),
+            rx.vstack(
+                rx.heading("Uma nova senha,\nmesmo acesso.", class_name="login-visual-title", size="8"),
+                rx.text(
+                    "Proteja sua conta e volte a solicitar ajuda quando precisar.",
+                    class_name="login-visual-copy",
+                ),
+                align="start",
+                spacing="3",
+                class_name="login-visual-copy-block",
+            ),
+            class_name="login-visual-panel",
+        ),
+        class_name="login-page",
+    )
+
+
 def signup_screen() -> rx.Component:
     return rx.box(
         rx.box(
@@ -2770,6 +3241,17 @@ def login_screen() -> rx.Component:
                     ),
                     on_submit=AppState.login,
                     width="100%",
+                ),
+                rx.hstack(
+                    rx.spacer(),
+                    rx.button(
+                        "Esqueci minha senha",
+                        on_click=AppState.open_password_recovery,
+                        class_name="login-inline-link",
+                        type="button",
+                    ),
+                    width="100%",
+                    align="center",
                 ),
                 rx.hstack(
                     rx.text("Não tem conta?", class_name="login-secondary-text"),
@@ -3039,7 +3521,7 @@ def customer_dashboard() -> rx.Component:
         # Top Navigation Bar
         rx.hstack(
             rx.button(
-                rx.text("🏠 Home"),
+                rx.text("🏠 Início"),
                 on_click=rx.redirect("/home"),
                 class_name="glass-panel",
                 padding="0.5rem 1rem",
@@ -3112,20 +3594,60 @@ def customer_dashboard() -> rx.Component:
                 margin_bottom="1.5rem",
                 align="center",
             ),
-            rx.text("Do que você precisa?", weight="bold", size="6", margin_bottom="1rem", color=COLORS["text"], text_align="center"),
+            rx.hstack(
+                rx.vstack(
+                    rx.heading("Do que você precisa?", size="6", color=COLORS["text"]),
+                    rx.text(
+                        "Escolha o serviço e chamamos o profissional mais próximo.",
+                        color=COLORS["muted"],
+                        font_size="0.9rem",
+                    ),
+                    align="start",
+                    spacing="1",
+                ),
+                rx.box(
+                    rx.hstack(
+                        rx.text("⌖", font_size="1.2rem"),
+                        rx.vstack(
+                            rx.text("Você está em", color=COLORS["muted"], font_size="0.7rem"),
+                            rx.text(
+                                rx.cond(
+                                    (OperationalState.client_location["lat"] != 0.0)
+                                    & (OperationalState.client_location["lng"] != 0.0),
+                                    "Localização atual",
+                                    "Localização não informada",
+                                ),
+                                color=COLORS["navy"],
+                                font_size="0.82rem",
+                                weight="bold",
+                            ),
+                            align="start",
+                            spacing="0",
+                        ),
+                        spacing="2",
+                        align="center",
+                    ),
+                    class_name="client-location-pill",
+                ),
+                width="100%",
+                justify="between",
+                align="center",
+                flex_direction=["column", "column", "row"],
+                spacing="4",
+            ),
             rx.grid(
                 rx.box(
                     rx.vstack(
                         rx.text("🚗", font_size="1.8rem"),
                         rx.text("Pneu Furado", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
                     ),
-                    on_click=OperationalState.submit_customer_request("tire"),
-                    class_name="op-card",
+                    on_click=OperationalState.select_customer_service("tire"),
+                    class_name=rx.cond(OperationalState.selected_service == "tire", "client-service-card selected", "client-service-card"),
                     width="100%",
-                    height="90px",
+                    height="7.5rem",
                     border_radius="16px",
                     cursor="pointer",
-                    align="center",
+                    align="start",
                     justify="center",
                 ),
                 rx.box(
@@ -3133,13 +3655,13 @@ def customer_dashboard() -> rx.Component:
                         rx.text("🔋", font_size="1.8rem"),
                         rx.text("Bateria", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
                     ),
-                    on_click=OperationalState.submit_customer_request("battery"),
-                    class_name="op-card",
+                    on_click=OperationalState.select_customer_service("battery"),
+                    class_name=rx.cond(OperationalState.selected_service == "battery", "client-service-card selected", "client-service-card"),
                     width="100%",
-                    height="90px",
+                    height="7.5rem",
                     border_radius="16px",
                     cursor="pointer",
-                    align="center",
+                    align="start",
                     justify="center",
                 ),
                 rx.box(
@@ -3147,13 +3669,13 @@ def customer_dashboard() -> rx.Component:
                         rx.text("🔧", font_size="1.8rem"),
                         rx.text("Mecânica", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
                     ),
-                    on_click=OperationalState.submit_customer_request("mechanical"),
-                    class_name="op-card",
+                    on_click=OperationalState.select_customer_service("mechanical"),
+                    class_name=rx.cond(OperationalState.selected_service == "mechanical", "client-service-card selected", "client-service-card"),
                     width="100%",
-                    height="90px",
+                    height="7.5rem",
                     border_radius="16px",
                     cursor="pointer",
-                    align="center",
+                    align="start",
                     justify="center",
                 ),
                 rx.box(
@@ -3161,18 +3683,68 @@ def customer_dashboard() -> rx.Component:
                         rx.text("⛽", font_size="1.8rem"),
                         rx.text("Combustível", font_size="0.8rem", color=COLORS["text"], weight="bold", text_align="center"),
                     ),
-                    on_click=OperationalState.submit_customer_request("fuel"),
-                    class_name="op-card",
+                    on_click=OperationalState.select_customer_service("fuel"),
+                    class_name=rx.cond(OperationalState.selected_service == "fuel", "client-service-card selected", "client-service-card"),
                     width="100%",
-                    height="90px",
+                    height="7.5rem",
                     border_radius="16px",
                     cursor="pointer",
-                    align="center",
+                    align="start",
                     justify="center",
                 ),
                 columns="2",
                 spacing="3",
                 width="100%",
+                class_name="client-service-card-grid",
+            ),
+            rx.hstack(
+                rx.button(
+                    rx.hstack(
+                        rx.text(
+                            rx.cond(
+                                OperationalState.selected_service == "tire",
+                                "Pedir socorro para Pneu Furado",
+                                rx.cond(
+                                    OperationalState.selected_service == "battery",
+                                    "Pedir socorro para Bateria",
+                                    rx.cond(
+                                        OperationalState.selected_service == "mechanical",
+                                        "Pedir socorro para Mecânica",
+                                        rx.cond(
+                                            OperationalState.selected_service == "fuel",
+                                            "Pedir socorro para Combustível",
+                                            "Escolha o tipo de socorro",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                            weight="bold",
+                        ),
+                        rx.text("→", font_size="1.2rem"),
+                        spacing="3",
+                        justify="center",
+                    ),
+                    on_click=OperationalState.submit_selected_customer_request,
+                    class_name="client-request-cta",
+                    width="100%",
+                    disabled=OperationalState.selected_service == "",
+                ),
+                rx.cond(
+                    OperationalState.request_id != None,
+                    rx.button(
+                        rx.hstack(rx.text("💬"), rx.text("Mensagens do chamado"), spacing="2"),
+                        on_click=[
+                            OperationalState.open_client_message_panel,
+                            OperationalState.poll_service_messages,
+                        ],
+                        class_name="client-message-cta",
+                        width="100%",
+                    ),
+                    rx.box(width="100%"),
+                ),
+                width="100%",
+                spacing="3",
+                align="stretch",
             ),
             # Request Status Overlay
             rx.cond(
@@ -3225,18 +3797,6 @@ def customer_dashboard() -> rx.Component:
                     ),
                     spacing="2",
                     align="center",
-                    width="100%",
-                ),
-            ),
-            rx.cond(
-                OperationalState.request_id != None,
-                rx.button(
-                    rx.hstack(rx.text("💬"), rx.text("Mensagens do chamado"), spacing="2"),
-                    on_click=[
-                        OperationalState.open_client_message_panel,
-                        OperationalState.poll_service_messages,
-                    ],
-                    class_name="secondary-button",
                     width="100%",
                 ),
             ),
@@ -5179,8 +5739,10 @@ app = rx.App(
 app.add_page(index, route="/", title="SOS Drive | Assistência quando importa")
 app.add_page(signup_screen, route="/signup", title="Cadastro | SOS Drive")
 app.add_page(login_screen, route="/login", title="Login | SOS Drive")
+app.add_page(forgot_password_screen, route="/esqueci-senha", title="Esqueci minha senha | SOS Drive")
+app.add_page(reset_password_screen, route="/redefinir-senha", title="Redefinir senha | SOS Drive")
 app.add_page(lambda: protected_page(home_screen), route="/home", title="Home | SOS Drive")
-app.add_page(lambda: protected_page(user_home_screen), route="/home_client", title="Home Cliente | SOS Drive")
+app.add_page(lambda: protected_page(customer_dashboard), route="/home_client", title="Home Cliente | SOS Drive")
 app.add_page(lambda: protected_page(customer_dashboard), route="/customer", title="Dashboard Cliente | SOS Drive")
 app.add_page(lambda: protected_page(provider_dashboard), route="/provider", title="Dashboard Prestador | SOS Drive")
 app.add_page(lambda: protected_page(provider_home_screen), route="/home_provider", title="Solicitações Próximas | SOS Drive")

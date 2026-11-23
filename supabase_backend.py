@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, ParamSpec, TypeVar
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -229,6 +229,11 @@ def sign_up(email: str, password: str, name: str, role: str) -> SupabaseSession 
         code = _auth_error_code(error)
         if status == 409 or code in {"user_already_exists", "user_already_registered"}:
             raise SupabaseBackendError(409, "This email is already registered") from error
+        if status == 422:
+            raise SupabaseBackendError(
+                422,
+                "Supabase rejected weak password or invalid signup data",
+            ) from error
         if status == 400:
             raise SupabaseBackendError(
                 400,
@@ -277,6 +282,48 @@ def sign_in(email: str, password: str) -> SupabaseSession:
             ) from error
         if status in {400, 401, 403}:
             raise SupabaseAuthenticationError(status, "Email or password is incorrect") from error
+        raise _translate_error(error) from error
+
+
+@_manage_clients
+def request_password_reset(email: str, redirect_origin: str) -> None:
+    """Request a Supabase password recovery email."""
+    client = _client()
+    redirect_origin = redirect_origin.strip().rstrip("/")
+    parsed_redirect = urlsplit(redirect_origin)
+    if (
+        parsed_redirect.scheme not in {"http", "https"}
+        or not parsed_redirect.hostname
+        or parsed_redirect.username
+        or parsed_redirect.password
+        or parsed_redirect.query
+        or parsed_redirect.fragment
+    ):
+        raise SupabaseBackendError(400, "Invalid recovery redirect origin")
+    try:
+        client.auth.reset_password_for_email(
+            email.strip().lower(),
+            {"redirect_to": f"{redirect_origin}/redefinir-senha"},
+        )
+    except SupabaseBackendError:
+        raise
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
+@_manage_clients
+def update_password(access_token: str, refresh_token: str, password: str) -> None:
+    """Update the password for the recovery session."""
+    password = password or ""
+    if len(password) < 6:
+        raise SupabaseAuthenticationError(400, "Password must contain at least 6 characters")
+    client = _client()
+    try:
+        client.auth.set_session(access_token.strip(), refresh_token.strip())
+        client.auth.update_user({"password": password})
+    except SupabaseBackendError:
+        raise
+    except Exception as error:
         raise _translate_error(error) from error
 
 

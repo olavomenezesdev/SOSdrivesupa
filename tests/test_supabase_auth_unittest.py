@@ -9,6 +9,7 @@ from sosdrive import (
     SupabaseConfigurationRuntimeError,
     SupabaseSession,
 )
+from supabase_backend import request_password_reset, update_password
 
 
 def make_auth_state(email="ana@example.com", password="secret"):
@@ -45,6 +46,17 @@ def make_auth_state(email="ana@example.com", password="secret"):
         "resend_message": "",
         "resend_cooldown_until": 0,
         "is_resending_confirmation": False,
+        "recovery_email": "",
+        "recovery_message": "",
+        "recovery_error": "",
+        "recovery_password": "",
+        "recovery_password_confirmation": "",
+        "recovery_ready": False,
+        "recovery_access_token": "",
+        "recovery_refresh_token": "",
+        "is_recovering_password": False,
+        "recovery_success_message": "",
+        "recovery_origin": "",
     }
     for name, value in values.items():
         object.__setattr__(state, name, value)
@@ -317,6 +329,103 @@ class TestSupabaseLogin(unittest.TestCase):
         self.assertNotIn("incorretos", state.error_message)
         self.assertEqual(state.pending_confirmation_email, "ana@example.com")
         self.assertFalse(state.is_loading)
+
+
+    def test_signup_rejects_short_password_before_supabase_call(self):
+        state = make_auth_state(password="123")
+        with patch("sosdrive.sign_up_supabase") as sign_up:
+            consume_event_generator(state.signup())
+        sign_up.assert_not_called()
+        self.assertEqual(state.error_message, "A senha deve ter pelo menos 6 caracteres.")
+        self.assertFalse(state.is_loading)
+
+    def test_signup_unprocessable_entity_is_safe(self):
+        state = make_auth_state()
+        with patch(
+            "sosdrive.sign_up_supabase",
+            side_effect=SupabaseBackendError(422, "private auth payload"),
+        ):
+            consume_event_generator(state.signup())
+        self.assertIn("senha", state.error_message.lower())
+        self.assertIn("6 caracteres", state.error_message)
+        self.assertNotIn("private auth payload", state.error_message)
+        self.assertFalse(state.is_loading)
+
+
+class TestPasswordRecovery(unittest.TestCase):
+    def test_recovery_request_uses_redirect_and_generic_state(self):
+        state = make_auth_state()
+        state.recovery_email = "ana@example.com"
+        state.recovery_origin = "https://sosdrive.example"
+        with patch("sosdrive.request_password_reset_supabase") as recovery:
+            consume_event_generator(state.send_password_recovery())
+        recovery.assert_called_once_with(
+            "ana@example.com",
+            "https://sosdrive.example",
+        )
+        self.assertEqual(
+            state.recovery_message,
+            "Se esse e-mail estiver cadastrado, você receberá um link",
+        )
+        self.assertEqual(state.recovery_error, "")
+        self.assertFalse(state.is_loading)
+
+    def test_recovery_request_failure_is_friendly(self):
+        state = make_auth_state()
+        state.recovery_email = "ana@example.com"
+        state.recovery_origin = "https://sosdrive.example"
+        with patch(
+            "sosdrive.request_password_reset_supabase",
+            side_effect=SupabaseBackendError(503, "private details"),
+        ):
+            consume_event_generator(state.send_password_recovery())
+        self.assertIn("Não foi possível", state.recovery_error)
+        self.assertNotIn("private details", state.recovery_error)
+        self.assertFalse(state.is_loading)
+
+    def test_password_recovery_event_enables_form(self):
+        state = make_auth_state()
+        payload = (
+            '{"event":"PASSWORD_RECOVERY","access_token":"access-token",'
+            '"refresh_token":"refresh-token"}'
+        )
+        state.handle_password_recovery_event(payload)
+        self.assertTrue(state.recovery_ready)
+        self.assertEqual(state.recovery_access_token, "access-token")
+        self.assertEqual(state.recovery_refresh_token, "refresh-token")
+
+    def test_password_recovery_rejects_short_password(self):
+        state = make_auth_state()
+        state.recovery_ready = True
+        state.recovery_access_token = "access-token"
+        state.recovery_refresh_token = "refresh-token"
+        state.recovery_password = "123"
+        state.recovery_password_confirmation = "123"
+        consume_event_generator(state.update_recovery_password())
+        self.assertIn("6 caracteres", state.recovery_error)
+
+    def test_password_recovery_rejects_mismatched_password(self):
+        state = make_auth_state()
+        state.recovery_ready = True
+        state.recovery_access_token = "access-token"
+        state.recovery_refresh_token = "refresh-token"
+        state.recovery_password = "123456"
+        state.recovery_password_confirmation = "654321"
+        consume_event_generator(state.update_recovery_password())
+        self.assertIn("iguais", state.recovery_error)
+
+    def test_password_recovery_success_updates_user_and_redirects(self):
+        state = make_auth_state()
+        state.recovery_ready = True
+        state.recovery_access_token = "access-token"
+        state.recovery_refresh_token = "refresh-token"
+        state.recovery_password = "123456"
+        state.recovery_password_confirmation = "123456"
+        with patch("sosdrive.update_password_supabase") as update:
+            events = consume_event_generator(state.update_recovery_password())
+        update.assert_called_once_with("access-token", "refresh-token", "123456")
+        self.assertEqual(state.recovery_success_message, "Senha redefinida com sucesso.")
+        self.assertIn("/login", repr(events[-1]))
 
 
 if __name__ == "__main__":
