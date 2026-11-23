@@ -28,6 +28,7 @@ from supabase_backend import (
     send_service_message,
     sign_in,
     signed_profile_photo_url,
+    start_service_request,
     upload_profile_photo,
 )
 from supabase_config import get_supabase_settings
@@ -372,10 +373,31 @@ class TestSupabaseDisposableProject(unittest.TestCase):
             send_service_message(outsider.access_token, request_id, "Não autorizado")
         self.assertEqual(outsider_message_error.exception.status_code, 403)
 
+        with self.assertRaises(SupabaseBackendError) as client_start_error:
+            start_service_request(client.access_token, request_id)
+        self.assertEqual(client_start_error.exception.status_code, 403)
+        with self.assertRaises(SupabaseBackendError) as unassigned_start_error:
+            start_service_request(other_provider.access_token, request_id)
+        self.assertEqual(unassigned_start_error.exception.status_code, 403)
+
+        started = start_service_request(winner.access_token, request_id)
+        self.assertEqual(started["status"], "in_progress")
+        repeated_start = start_service_request(winner.access_token, request_id)
+        self.assertEqual(repeated_start["status"], "in_progress")
+        self.assertEqual(
+            fetch_service_request(client.access_token, request_id)["status"],
+            "in_progress",
+        )
+
         released = release_service_request(winner.access_token, request_id)
         self.assertEqual(released["status"], "pending")
         reassigned = accept_service_request(other_provider.access_token, request_id)
         self.assertEqual(str(reassigned["provider_id"]), str(self.users["prestador_a"] if other_provider is provider_a else self.users["prestador_b"]))
+        started_after_reassignment = start_service_request(
+            other_provider.access_token,
+            request_id,
+        )
+        self.assertEqual(started_after_reassignment["status"], "in_progress")
         completed = complete_service_request(other_provider.access_token, request_id)
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(fetch_service_request(client.access_token, request_id)["status"], "completed")

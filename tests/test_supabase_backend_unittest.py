@@ -14,6 +14,7 @@ from supabase_backend import (
     send_service_message,
     sign_in,
     sign_up,
+    start_service_request,
 )
 
 
@@ -350,6 +351,49 @@ class TestSupabaseBackend(unittest.TestCase):
             }
         )
         self.assertEqual(message["sender_id"], "auth-user-uuid")
+
+    def test_start_service_request_calls_authenticated_rpc_and_returns_in_progress_row(self):
+        client = Mock()
+        request = {"id": 42, "provider_id": "provider-uuid", "status": "in_progress"}
+        client.rpc.return_value.execute.return_value.data = [request]
+
+        with patch("supabase_backend._authenticated_client", return_value=client):
+            result = start_service_request("provider-token", 42)
+
+        client.rpc.assert_called_once_with(
+            "start_service_request",
+            {"p_request_id": 42},
+        )
+        self.assertEqual(result, request)
+
+    def test_start_service_request_rejects_unexpected_status(self):
+        client = Mock()
+        client.rpc.return_value.execute.return_value.data = [
+            {"id": 42, "status": "accepted"}
+        ]
+
+        with (
+            patch("supabase_backend._authenticated_client", return_value=client),
+            self.assertRaises(SupabaseBackendError) as raised,
+        ):
+            start_service_request("provider-token", 42)
+
+        self.assertEqual(raised.exception.status_code, 502)
+
+    def test_start_service_request_surfaces_authorization_errors(self):
+        client = Mock()
+        error = RuntimeError("private database response")
+        error.code = "42501"
+        client.rpc.side_effect = error
+
+        with (
+            patch("supabase_backend._authenticated_client", return_value=client),
+            self.assertRaises(SupabaseBackendError) as raised,
+        ):
+            start_service_request("provider-token", 42)
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertNotIn("private database response", str(raised.exception))
 
 
 if __name__ == "__main__":
