@@ -295,6 +295,9 @@ def request_password_reset(email: str, redirect_origin: str) -> None:
     """Request a Supabase password recovery email."""
     client = _client()
     redirect_origin = redirect_origin.strip().rstrip("/")
+    email = email.strip().lower()
+    if not email or "@" not in email:
+        raise SupabaseAuthenticationError(400, "Invalid email")
     parsed_redirect = urlsplit(redirect_origin)
     if (
         parsed_redirect.scheme not in {"http", "https"}

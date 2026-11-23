@@ -353,6 +353,17 @@ class TestSupabaseLogin(unittest.TestCase):
 
 
 class TestPasswordRecovery(unittest.TestCase):
+    def test_recovery_fallback_uses_local_reset_route(self):
+        state = make_auth_state()
+        state.recovery_email = "ana@example.com"
+        state.recovery_origin = ""
+        with patch("sosdrive.request_password_reset_supabase") as recovery:
+            consume_event_generator(state.send_password_recovery())
+        recovery.assert_called_once_with(
+            "ana@example.com",
+            "http://localhost:3000",
+        )
+
     def test_recovery_request_uses_redirect_and_generic_state(self):
         state = make_auth_state()
         state.recovery_email = "ana@example.com"

@@ -44,6 +44,8 @@ from supabase_backend import (
     sign_in as sign_in_supabase,
     sign_up as sign_up_supabase,
     start_service_request as start_service_request_supabase,
+    request_password_reset as request_password_reset_supabase,
+    update_password as update_password_supabase,
     upload_profile_photo as upload_profile_photo_supabase,
 )
 from supabase_config import get_supabase_settings
@@ -712,6 +714,7 @@ class AuthState(rx.State):
     recovery_password: str = ""
     recovery_password_confirmation: str = ""
     recovery_ready: bool = False
+    recovery_checking: bool = True
     recovery_access_token: str = ""
     recovery_refresh_token: str = ""
     is_recovering_password: bool = False
@@ -814,8 +817,21 @@ class AuthState(rx.State):
 
     def clear_password_recovery_listener(self) -> None:
         self.recovery_ready = False
+        self.recovery_checking = False
         self.recovery_access_token = ""
         self.recovery_refresh_token = ""
+
+    @rx.event
+    def begin_password_recovery_check(self):
+        self.recovery_ready = False
+        self.recovery_checking = True
+        self.recovery_access_token = ""
+        self.recovery_refresh_token = ""
+
+    @rx.event
+    def finish_password_recovery_check(self, _value: str):
+        if not self.recovery_ready:
+            self.recovery_checking = False
 
     @rx.event
     async def send_password_recovery(self):
@@ -833,9 +849,7 @@ class AuthState(rx.State):
         try:
             origin = (self.recovery_origin or "").strip()
             if not origin:
-                redirect_url = os.getenv("SUPABASE_EMAIL_REDIRECT_URL", "").strip()
-                parsed_redirect = urlsplit(redirect_url)
-                origin = f"{parsed_redirect.scheme}://{parsed_redirect.netloc}"
+                origin = "http://localhost:3000"
             await asyncio.to_thread(
                 request_password_reset_supabase,
                 email,
@@ -846,7 +860,13 @@ class AuthState(rx.State):
             self.recovery_error = "Não foi possível configurar o link de recuperação neste ambiente."
         except SupabaseBackendError as error:
             logger.error("Password recovery request failed status=%s", error.status_code)
-            self.recovery_error = "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
+            if error.status_code == 400:
+                self.recovery_error = (
+                    "Não foi possível enviar o link. Confira se "
+                    "http://localhost:3000/redefinir-senha está autorizado no Supabase."
+                )
+            else:
+                self.recovery_error = "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
         finally:
             self.is_loading = False
 
@@ -860,9 +880,11 @@ class AuthState(rx.State):
             return
         if payload.get("event") != "PASSWORD_RECOVERY":
             return
-        self.recovery_ready = True
         self.recovery_access_token = str(payload.get("access_token") or "")
         self.recovery_refresh_token = str(payload.get("refresh_token") or "")
+        if self.recovery_access_token and self.recovery_refresh_token:
+            self.recovery_checking = False
+            self.recovery_ready = True
 
     @rx.event
     async def update_recovery_password(self):
@@ -3400,10 +3422,21 @@ def reset_password_screen() -> rx.Component:
             }}));
             input.dispatchEvent(new Event('input', {{ bubbles: true }}));
         }};
+        const notifyInvalidRecovery = () => {{
+            const input = document.getElementById('recovery-invalid-trigger');
+            if (!input) return;
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+            setter.call(input, String(Date.now()));
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        }};
         const initialize = () => {{
             if (!window.supabase) {{
                 attempts += 1;
                 if (attempts < 100) window.setTimeout(initialize, 50);
+                else notifyInvalidRecovery();
                 return;
             }}
             window.sosRecoveryClient = window.supabase.createClient(
@@ -3423,9 +3456,14 @@ def reset_password_screen() -> rx.Component:
                 if (code) {{
                     try {{
                         const result = await window.sosRecoveryClient.auth.exchangeCodeForSession(code);
-                        notifyRecovery(result.data?.session);
+                        if (result.data?.session) {{
+                            notifyRecovery(result.data.session);
+                        }} else {{
+                            notifyInvalidRecovery();
+                        }}
                     }} catch (error) {{
                         console.error('Não foi possível processar o código de recuperação.');
+                        notifyInvalidRecovery();
                     }}
                     return;
                 }}
@@ -3440,10 +3478,17 @@ def reset_password_screen() -> rx.Component:
                             accessToken,
                             refreshToken
                         );
-                        notifyRecovery(result.data?.session);
+                        if (result.data?.session) {{
+                            notifyRecovery(result.data.session);
+                        }} else {{
+                            notifyInvalidRecovery();
+                        }}
                     }} catch (error) {{
                         console.error('Não foi possível processar o link de recuperação.');
+                        notifyInvalidRecovery();
                     }}
+                }} else {{
+                    notifyInvalidRecovery();
                 }}
             }})();
         }};
@@ -3561,9 +3606,16 @@ def reset_password_screen() -> rx.Component:
                     id="recovery-event-trigger",
                     display="none",
                 ),
+                rx.input(
+                    value="",
+                    on_change=AppState.finish_password_recovery_check,
+                    id="recovery-invalid-trigger",
+                    display="none",
+                ),
                 rx.script(
                     src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2",
                     on_mount=[
+                        AppState.begin_password_recovery_check,
                         rx.call_script(recovery_listener_script),
                     ],
                     on_unmount=[
