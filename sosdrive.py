@@ -58,7 +58,6 @@ from supabase_backend import (
     fetch_service_payment_status as fetch_service_payment_status_supabase,
     fetch_service_payment_context as fetch_service_payment_context_supabase,
     process_asaas_webhook as process_asaas_webhook_supabase,
-    request_password_reset as request_password_reset_supabase,
     update_password as update_password_supabase,
     upload_profile_photo as upload_profile_photo_supabase,
 )
@@ -733,7 +732,6 @@ class AuthState(rx.State):
     recovery_refresh_token: str = ""
     is_recovering_password: bool = False
     recovery_success_message: str = ""
-    recovery_origin: str = ""
     active_call_status: str | None = None
     active_call_eta: str = "15 min"
 
@@ -823,12 +821,6 @@ class AuthState(rx.State):
     def set_recovery_password_confirmation(self, value: str) -> None:
         self.recovery_password_confirmation = value
 
-    def set_recovery_origin(self, value: str) -> None:
-        self.recovery_origin = value
-
-    def handle_recovery_origin(self, value: str) -> None:
-        self.recovery_origin = value
-
     def clear_password_recovery_listener(self) -> None:
         self.recovery_ready = False
         self.recovery_checking = False
@@ -848,41 +840,125 @@ class AuthState(rx.State):
             self.recovery_checking = False
 
     @rx.event
+    def begin_password_recovery_request(self):
+        self.is_loading = False
+        self.recovery_message = ""
+        self.recovery_error = ""
+
+    @rx.event
     async def send_password_recovery(self):
         if self.is_loading:
             return
         self.recovery_message = ""
         self.recovery_error = ""
-        email = (self.recovery_email or "").strip()
-        if not email:
-            self.recovery_error = "Informe seu e-mail."
-            return
-
         self.is_loading = True
         yield
+        yield rx.call_script(
+            """
+            (() => {
+                const resultInput = document.getElementById(
+                    'recovery-request-result-trigger'
+                );
+                const report = (result) => {
+                    if (!resultInput) return;
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype,
+                        'value'
+                    ).set;
+                    setter.call(resultInput, JSON.stringify(result));
+                    resultInput.dispatchEvent(new Event('input', { bubbles: true }));
+                };
+                let attempts = 0;
+                const submit = () => {
+                    if (!window.sosRecoveryClient) {
+                        attempts += 1;
+                        if (attempts < 100) {
+                            window.setTimeout(submit, 50);
+                        } else {
+                            report({ status: 'unavailable' });
+                        }
+                        return;
+                    }
+                    const emailInput = document.getElementById('recovery-email-input');
+                    const email = emailInput?.value.trim() || '';
+                    if (!email) {
+                        report({ status: 'invalid_email' });
+                        return;
+                    }
+                    window.sosRecoveryClient.auth.resetPasswordForEmail(email, {
+                        redirectTo: `${window.location.origin}/redefinir-senha`
+                    }).then(({ error }) => {
+                        if (error) {
+                            console.error(
+                                'Falha ao solicitar recuperação de senha.',
+                                error.status,
+                                error.code
+                            );
+                            report({
+                                status: 'error',
+                                statusCode: error.status
+                            });
+                            return;
+                        }
+                        report({ status: 'success' });
+                    }).catch((error) => {
+                        console.error(
+                            'Falha ao solicitar recuperação de senha.',
+                            error.status,
+                            error.code
+                        );
+                        report({
+                            status: 'error',
+                            statusCode: error.status
+                        });
+                    });
+                };
+                submit();
+            })();
+            """
+        )
+
+    @rx.event
+    def handle_password_recovery_request_result(self, value: str):
+        self.is_loading = False
         try:
-            origin = (self.recovery_origin or "").strip()
-            if not origin:
-                origin = "http://localhost:3000"
-            await asyncio.to_thread(
-                request_password_reset_supabase,
-                email,
-                origin,
+            result = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.error("Password recovery request returned an invalid browser result")
+            self.recovery_error = (
+                "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
             )
+            return
+
+        status = result.get("status")
+        if status == "success":
             self.recovery_message = "Se esse e-mail estiver cadastrado, você receberá um link"
-        except SupabaseConfigurationRuntimeError:
-            self.recovery_error = "Não foi possível configurar o link de recuperação neste ambiente."
-        except SupabaseBackendError as error:
-            logger.error("Password recovery request failed status=%s", error.status_code)
-            if error.status_code == 400:
+        elif status == "invalid_email":
+            self.recovery_error = "Informe seu e-mail."
+        elif status == "error":
+            logger.error(
+                "Password recovery request failed status=%s",
+                result.get("statusCode"),
+            )
+            if result.get("statusCode") == 400:
                 self.recovery_error = (
-                    "Não foi possível enviar o link. Confira se "
-                    "http://localhost:3000/redefinir-senha está autorizado no Supabase."
+                    "Não foi possível enviar o link. Confira se a URL de redefinição "
+                    "está autorizada no Supabase."
                 )
             else:
-                self.recovery_error = "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
-        finally:
-            self.is_loading = False
+                self.recovery_error = (
+                    "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
+                )
+        elif status == "unavailable":
+            logger.error("Supabase browser client did not initialize for password recovery")
+            self.recovery_error = (
+                "Não foi possível iniciar a recuperação. Atualize a página e tente novamente."
+            )
+        else:
+            logger.error("Password recovery request returned an unexpected browser result")
+            self.recovery_error = (
+                "Não foi possível enviar o link. Verifique sua conexão e tente novamente."
+            )
 
     @rx.event
     def handle_password_recovery_event(self, event_payload: str):
@@ -3832,6 +3908,7 @@ def resend_confirmation_controls() -> rx.Component:
 
 
 def forgot_password_screen() -> rx.Component:
+    settings = get_supabase_settings()
     return rx.box(
         rx.box(
             rx.hstack(
@@ -3848,11 +3925,23 @@ def forgot_password_screen() -> rx.Component:
                 ),
                 rx.form(
                     rx.vstack(
-                        text_input(
-                            "E-mail",
-                            "voce@email.com",
-                            AppState.recovery_email,
-                            AppState.set_recovery_email,
+                        rx.vstack(
+                            rx.text("E-mail", class_name="field-label"),
+                            rx.input(
+                                value=AppState.recovery_email,
+                                placeholder="voce@email.com",
+                                on_change=AppState.set_recovery_email,
+                                id="recovery-email-input",
+                                width="100%",
+                                height="3.25rem",
+                                padding="0 1rem",
+                                border_radius="14px",
+                                border=f"1px solid {COLORS['line']}",
+                                background="white",
+                                color=COLORS["text"],
+                            ),
+                            width="100%",
+                            spacing="2",
                         ),
                         rx.button(
                             rx.cond(AppState.is_loading, "Enviando...", "Enviar link de recuperação"),
@@ -3891,25 +3980,34 @@ def forgot_password_screen() -> rx.Component:
                 class_name="login-form-content",
             ),
             rx.input(
-                value=AppState.recovery_origin,
-                on_change=AppState.set_recovery_origin,
-                id="recovery-origin-trigger",
+                value="",
+                on_change=AppState.handle_password_recovery_request_result,
+                id="recovery-request-result-trigger",
                 display="none",
             ),
-            on_mount=rx.call_script(
-                """
-                (() => {
-                    const input = document.getElementById('recovery-origin-trigger');
-                    if (!input) return;
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype,
-                        'value'
-                    ).set;
-                    setter.call(input, window.location.origin);
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                })();
-                """
-            ),
+            on_mount=[
+                AppState.begin_password_recovery_request,
+                rx.call_script(
+                    f"""
+                    (() => {{
+                        let attempts = 0;
+                        const initialize = () => {{
+                            if (!window.supabase) {{
+                                attempts += 1;
+                                if (attempts < 100) window.setTimeout(initialize, 50);
+                                return;
+                            }}
+                            window.sosRecoveryClient = window.sosRecoveryClient
+                                || window.supabase.createClient(
+                                    {json.dumps(settings.url)},
+                                    {json.dumps(settings.anon_key)}
+                                );
+                        }};
+                        initialize();
+                    }})();
+                    """
+                ),
+            ],
             class_name="login-form-panel",
         ),
         rx.box(
@@ -3972,10 +4070,11 @@ def reset_password_screen() -> rx.Component:
                 else notifyInvalidRecovery();
                 return;
             }}
-            window.sosRecoveryClient = window.supabase.createClient(
-                {json.dumps(settings.url)},
-                {json.dumps(settings.anon_key)}
-            );
+            window.sosRecoveryClient = window.sosRecoveryClient
+                || window.supabase.createClient(
+                    {json.dumps(settings.url)},
+                    {json.dumps(settings.anon_key)}
+                );
             window.sosRecoverySubscription = window.sosRecoveryClient.auth.onAuthStateChange(
                 (event, session) => {{
                     if (event !== 'PASSWORD_RECOVERY') return;
@@ -4114,23 +4213,30 @@ def reset_password_screen() -> rx.Component:
                         width="100%",
                         spacing="4",
                     ),
-                    rx.vstack(
+                    rx.cond(
+                        AppState.recovery_checking,
                         rx.text(
-                            "Este link não é válido para redefinir senha ou a página foi aberta diretamente.",
-                            class_name="error-message",
+                            "Verificando o link de recuperação...",
+                            class_name="login-subtitle",
                         ),
-                        rx.link(
-                            "Solicitar outro link",
-                            href="/esqueci-senha",
-                            class_name="login-inline-link",
+                        rx.vstack(
+                            rx.text(
+                                "Este link não é válido para redefinir senha ou a página foi aberta diretamente.",
+                                class_name="error-message",
+                            ),
+                            rx.link(
+                                "Solicitar outro link",
+                                href="/esqueci-senha",
+                                class_name="login-inline-link",
+                            ),
+                            rx.link(
+                                "Voltar para o login",
+                                href="/login",
+                                class_name="login-inline-link",
+                            ),
+                            width="100%",
+                            spacing="3",
                         ),
-                        rx.link(
-                            "Voltar para o login",
-                            href="/login",
-                            class_name="login-inline-link",
-                        ),
-                        width="100%",
-                        spacing="3",
                     ),
                 ),
                 rx.input(
@@ -4145,23 +4251,20 @@ def reset_password_screen() -> rx.Component:
                     id="recovery-invalid-trigger",
                     display="none",
                 ),
-                rx.script(
-                    src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2",
-                    on_mount=[
-                        AppState.begin_password_recovery_check,
-                        rx.call_script(recovery_listener_script),
-                    ],
-                    on_unmount=[
-                        rx.call_script(
-                            "window.sosRecoverySubscription?.unsubscribe(); "
-                            "window.sosRecoverySubscription = null;"
-                        ),
-                        AppState.clear_password_recovery_listener,
-                    ],
-                ),
                 width="min(100%, 26rem)",
                 spacing="5",
                 class_name="login-form-content",
+                on_mount=[
+                    AppState.begin_password_recovery_check,
+                    rx.call_script(recovery_listener_script),
+                ],
+                on_unmount=[
+                    rx.call_script(
+                        "window.sosRecoverySubscription?.unsubscribe(); "
+                        "window.sosRecoverySubscription = null;"
+                    ),
+                    AppState.clear_password_recovery_listener,
+                ],
             ),
             class_name="login-form-panel",
         ),
@@ -7686,6 +7789,10 @@ app = rx.App(
         ),
         rx.script(
             src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js",
+            defer=True,
+        ),
+        rx.script(
+            src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2",
             defer=True,
         ),
         rx.script('''

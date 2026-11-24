@@ -9,7 +9,7 @@ from sosdrive import (
     SupabaseConfigurationRuntimeError,
     SupabaseSession,
 )
-from supabase_backend import request_password_reset, update_password
+from supabase_backend import update_password
 
 
 def make_auth_state(email="ana@example.com", password="secret"):
@@ -56,7 +56,7 @@ def make_auth_state(email="ana@example.com", password="secret"):
         "recovery_refresh_token": "",
         "is_recovering_password": False,
         "recovery_success_message": "",
-        "recovery_origin": "",
+        "recovery_checking": True,
     }
     for name, value in values.items():
         object.__setattr__(state, name, value)
@@ -369,27 +369,28 @@ class TestSupabaseLogin(unittest.TestCase):
 
 
 class TestPasswordRecovery(unittest.TestCase):
-    def test_recovery_fallback_uses_local_reset_route(self):
+    def test_password_recovery_page_mount_clears_stuck_loading_state(self):
         state = make_auth_state()
-        state.recovery_email = "ana@example.com"
-        state.recovery_origin = ""
-        with patch("sosdrive.request_password_reset_supabase") as recovery:
-            consume_event_generator(state.send_password_recovery())
-        recovery.assert_called_once_with(
-            "ana@example.com",
-            "http://localhost:3000",
-        )
+        state.is_loading = True
+        state.recovery_error = "Informe seu e-mail."
+        state.begin_password_recovery_request()
+        self.assertFalse(state.is_loading)
+        self.assertEqual(state.recovery_error, "")
 
-    def test_recovery_request_uses_redirect_and_generic_state(self):
+    def test_recovery_request_uses_browser_supabase_client_and_current_origin(self):
         state = make_auth_state()
         state.recovery_email = "ana@example.com"
-        state.recovery_origin = "https://sosdrive.example"
-        with patch("sosdrive.request_password_reset_supabase") as recovery:
-            consume_event_generator(state.send_password_recovery())
-        recovery.assert_called_once_with(
-            "ana@example.com",
-            "https://sosdrive.example",
-        )
+        events = consume_event_generator(state.send_password_recovery())
+        browser_script = repr(events[-1])
+        self.assertIn("resetPasswordForEmail", browser_script)
+        self.assertIn("window.location.origin", browser_script)
+        self.assertTrue(state.is_loading)
+
+    def test_recovery_request_result_is_generic_and_finishes_loading(self):
+        state = make_auth_state()
+        state.is_loading = True
+        state.handle_password_recovery_request_result('{"status":"success"}')
+
         self.assertEqual(
             state.recovery_message,
             "Se esse e-mail estiver cadastrado, você receberá um link",
@@ -399,15 +400,11 @@ class TestPasswordRecovery(unittest.TestCase):
 
     def test_recovery_request_failure_is_friendly(self):
         state = make_auth_state()
-        state.recovery_email = "ana@example.com"
-        state.recovery_origin = "https://sosdrive.example"
-        with patch(
-            "sosdrive.request_password_reset_supabase",
-            side_effect=SupabaseBackendError(503, "private details"),
-        ):
-            consume_event_generator(state.send_password_recovery())
+        state.is_loading = True
+        state.handle_password_recovery_request_result(
+            '{"status":"error","statusCode":503}'
+        )
         self.assertIn("Não foi possível", state.recovery_error)
-        self.assertNotIn("private details", state.recovery_error)
         self.assertFalse(state.is_loading)
 
     def test_password_recovery_event_enables_form(self):

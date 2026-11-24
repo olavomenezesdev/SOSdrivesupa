@@ -26,6 +26,6 @@ Nenhuma.
 
 - Dentro do escopo do MVP: autenticação e recuperação de acesso de Motoristas e Prestadores.
 - Não cria nem altera Motorista, Prestador, Chamado, Tipo de Socorro, Avaliação ou Localização.
-- Reutiliza o cliente Supabase já configurado no backend e os componentes visuais da tela de login.
+- Reutiliza a configuração pública existente do Supabase no navegador para iniciar o fluxo PKCE e o backend para atualizar a senha.
 - Não altera chamadas Xano, dados persistidos nem funcionalidades não relacionadas.
 - Não há migração de dados nem rollback de banco necessário.

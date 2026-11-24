@@ -21,9 +21,10 @@ O projeto usa Python/Reflex e já possui integração com Supabase em `supabase_
 
 ## Decisions
 
-1. **Centralizar chamadas Auth no adapter Supabase existente**
-   - As solicitações de recuperação e atualização serão expostas pelo backend já existente, mantendo credenciais e regras fora do estado da interface.
-   - Alternativa considerada: criar um segundo cliente ou chamar o Supabase diretamente no frontend. Não escolhida porque duplicaria a configuração e contrariaria o reuso solicitado.
+1. **Iniciar a recuperação no cliente Supabase do navegador**
+   - A chamada `resetPasswordForEmail` será iniciada no navegador para que o cliente PKCE persista o `code_verifier` no mesmo armazenamento usado ao retornar para `/redefinir-senha`.
+   - O cliente usa a URL e a chave pública já configuradas para o Supabase; a atualização da senha continua no backend pelo adapter existente.
+   - Alternativa considerada: iniciar a recuperação no backend. Não escolhida porque o backend não compartilha o armazenamento do navegador e o retorno `?code=...` não pode ser trocado sem o verifier PKCE.
 
 2. **Coordenar o evento `PASSWORD_RECOVERY` na interface**
    - A página de redefinição observará o evento de autenticação do Supabase e só renderizará o formulário após `PASSWORD_RECOVERY`.
