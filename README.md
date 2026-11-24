@@ -74,6 +74,18 @@ No macOS/Linux, instale e inicie assim:
 .venv/bin/reflex run
 ```
 
+Sempre execute o Reflex pelo ambiente virtual do projeto. O comando `reflex
+run` fora do `.venv` pode usar outra instalação do Python que não contém o
+cliente Supabase e falhar com `ImportError: cannot import name 'Client' from
+'supabase'`. Se o ambiente virtual ainda não existir, crie-o antes da
+instalação:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m reflex run
+```
+
 No Windows/PowerShell, também é possível definir as variáveis diretamente na
 sessão:
 
@@ -92,6 +104,24 @@ intervalo de 60 segundos. Se o Supabase responder `HTTP 429`, o app pede para
 aguardar alguns minutos e não repete a solicitação automaticamente. O histórico
 do Xano (contas, chamados, mensagens, veículos e fotos) não é importado;
 usuários precisam criar novas contas Supabase.
+
+Para pagamentos sandbox, configure `ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`,
+`SUPABASE_SERVICE_ROLE_KEY`, `ASAAS_CHECKOUT_RETURN_URL` e
+`ASAAS_CHECKOUT_FRONTEND_URL` no `.env`.
+`SUPABASE_SERVICE_ROLE_KEY` é usada somente pelo backend e nunca deve ser
+exposta ao navegador. `ASAAS_CHECKOUT_RETURN_URL` deve ser a origem HTTPS
+pública que encaminha ao backend (por exemplo, o domínio do túnel ngrok para a
+porta 8000); os retornos do Checkout passam por rotas do backend e redirecionam
+para `ASAAS_CHECKOUT_FRONTEND_URL` (em desenvolvimento,
+`http://localhost:3000`). No painel Asaas, configure o webhook em
+`<ASAAS_CHECKOUT_RETURN_URL>/api/asaas/webhook`, use o mesmo token e habilite
+`CHECKOUT_PAID`, `CHECKOUT_CANCELED` e `CHECKOUT_EXPIRED`.
+Para usar Pix no Sandbox, cadastre uma chave Pix na conta Asaas Sandbox.
+Depois de configurar `SUPABASE_DB_URL`, aplique as migrations pendentes com:
+
+```bash
+.venv/bin/python scripts/apply_supabase_migrations.py --apply
+```
 
 Para apresentar em dois computadores na mesma rede Wi-Fi, descubra o IPv4 do
 Mac que executará o app e inicie o Reflex usando esse endereço:

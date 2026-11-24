@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
+import httpx
 import requests
 
 from supabase_backend import (
@@ -20,12 +21,16 @@ from sosdrive import (
     AuthState,
     OperationalState,
     _load_project_environment,
+    payment_api,
     customer_dashboard,
     profile_screen,
+    payment_screen,
     provider_home_screen,
     provider_service_progress_screen,
+    review_screen,
     service_details_screen,
     user_home_screen,
+    waiting_payment_screen,
 )
 
 
@@ -37,6 +42,26 @@ class TestSupabaseRuntime(unittest.TestCase):
             str(component),
         )
 
+    def test_asaas_checkout_return_redirects_to_frontend_payment(self):
+        async def send_callback():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=payment_api),
+                base_url="http://testserver",
+            ) as client:
+                return await client.get(
+                    "/api/asaas/checkout-return/success",
+                    follow_redirects=False,
+                )
+
+        with patch.dict(
+            os.environ,
+            {"ASAAS_CHECKOUT_FRONTEND_URL": "http://localhost:3000"},
+        ):
+            response = asyncio.run(send_callback())
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "http://localhost:3000/payment")
+
     def test_provider_home_renders_empty_loading_error_and_retry_feedback(self):
         screen = provider_home_screen()
         rendered = self.render_component(screen)
@@ -47,10 +72,12 @@ class TestSupabaseRuntime(unittest.TestCase):
         self.assertIn("Tentar novamente", rendered)
         self.assertIn("load_pending_requests", rendered)
         self.assertIn("Solicitações Próximas", rendered)
+        self.assertIn("Pagar atendimento", self.render_component(customer_dashboard()))
         mount_events = screen.event_triggers["on_mount"].events
         self.assertEqual(
             [event.handler.fn.__name__ for event in mount_events],
             [
+                "ensure_provider_payment_complete",
                 "reset_provider_home",
                 "load_pending_requests",
                 "poll_pending_requests",
@@ -63,6 +90,337 @@ class TestSupabaseRuntime(unittest.TestCase):
         self.assertIn("Você ainda não tem um chamado em andamento. Solicite socorro quando precisar.", rendered)
         self.assertIn("Solicitar Socorro", rendered)
         self.assertIn("Chamado em andamento", rendered)
+
+    def test_payment_and_review_screens_use_hosted_checkout_and_payment_guards(self):
+        payment_component = payment_screen()
+        payment = self.render_component(payment_component)
+        waiting = waiting_payment_screen()
+        review = review_screen()
+
+        self.assertIn("Checkout seguro Asaas", payment)
+        self.assertIn("Cartão de Crédito", payment)
+        self.assertIn("Continuar no checkout seguro", payment)
+        self.assertIn("Status: aguardando confirmação", payment)
+        self.assertIn("Atualizar status do pagamento", payment)
+        self.assertNotIn(">Pix<", payment)
+        self.assertNotIn("Pagar na máquina", payment)
+        self.assertNotIn("Confirmar pagamento na máquina", payment)
+        self.assertEqual(payment.count("payment-method-card"), 1)
+        self.assertNotIn("Número do cartão", payment)
+        self.assertNotIn("CVV", payment)
+        self.assertEqual(
+            [
+                event.handler.fn.__name__
+                for event in payment_component.event_triggers["on_mount"].events
+            ],
+            ["load_payment_context", "poll_customer_payment"],
+        )
+        self.assertIn("Aguardando pagamento", self.render_component(waiting))
+        self.assertIn(
+            "Voltar para meus chamados",
+            self.render_component(review),
+        )
+        self.assertIn("/home_client", self.render_component(review))
+        self.assertEqual(
+            waiting.event_triggers["on_mount"].events[0].handler.fn.__name__,
+            "poll_provider_payment",
+        )
+        self.assertEqual(
+            review.event_triggers["on_mount"].events[0].handler.fn.__name__,
+            "ensure_review_payment_confirmed",
+        )
+        self.assertIn(
+            "Sua avaliação já foi registrada",
+            self.render_component(review),
+        )
+
+    def test_refresh_payment_status_requests_gateway_reconciliation(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "request_id": 42,
+            "payment_error": "",
+            "payment_message": "",
+            "payment_status": "pending",
+            "payment_amount": 0.0,
+            "checkout_url": "https://checkout.example",
+        }.items():
+            object.__setattr__(state, name, value)
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        object.__setattr__(state, "get_state", AsyncMock(return_value=auth_state))
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(
+                return_value={
+                    "status": "pending",
+                    "payment_method": "credit_card",
+                    "amount": 57.84,
+                    "checkout_url": "https://checkout.example",
+                }
+            ),
+        ) as fetch_status:
+            asyncio.run(OperationalState.refresh_payment_status.fn(state))
+
+        fetch_status.assert_awaited_once()
+        self.assertTrue(fetch_status.await_args.kwargs["reconcile_with_gateway"])
+        self.assertEqual(state.payment_status, "pending")
+        self.assertIn("Asaas", state.payment_message)
+        self.assertEqual(state.payment_error, "")
+
+    def test_provider_can_submit_review_using_attendance_request_id(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "review_loading": False,
+            "review_rating": 5,
+            "review_comment": "Ótimo atendimento",
+            "review_error": "",
+            "review_message": "",
+            "review_already_submitted": False,
+            "request_id": None,
+            "atendimento_mock": {"id": 42},
+        }.items():
+            object.__setattr__(state, name, value)
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        app_state = type("App", (), {"user_role": "prestador"})()
+        object.__setattr__(
+            state,
+            "get_state",
+            AsyncMock(side_effect=[auth_state, app_state]),
+        )
+
+        async def submit_review(_submit_function, _token, request_id, rating, comment):
+            self.assertEqual(request_id, 42)
+            self.assertEqual(rating, 5)
+            self.assertEqual(comment, "Ótimo atendimento")
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(side_effect=submit_review),
+        ) as submit:
+            async def consume():
+                return [
+                    event
+                    async for event in OperationalState.submit_review.fn(state)
+                ]
+
+            events = asyncio.run(consume())
+
+        submit.assert_awaited_once()
+        self.assertEqual(state.request_id, 42)
+        self.assertTrue(state.review_already_submitted)
+        self.assertEqual(state.review_message, "Avaliação enviada com sucesso.")
+        self.assertEqual(state.review_error, "")
+        self.assertFalse(state.review_loading)
+        self.assertIn("/home_provider", str(events[-1]))
+
+    def test_review_submission_reports_missing_request_id(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "review_loading": False,
+            "request_id": None,
+            "atendimento_mock": {},
+            "review_error": "",
+        }.items():
+            object.__setattr__(state, name, value)
+
+        async def consume():
+            return [
+                event
+                async for event in OperationalState.submit_review.fn(state)
+            ]
+
+        asyncio.run(consume())
+
+        self.assertIn("identificar o chamado", state.review_error)
+
+    def test_customer_returns_home_after_submitting_review(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "review_loading": False,
+            "review_rating": 4,
+            "review_comment": "Bom atendimento",
+            "review_error": "",
+            "review_message": "",
+            "review_already_submitted": False,
+            "request_id": 42,
+            "atendimento_mock": {},
+        }.items():
+            object.__setattr__(state, name, value)
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        app_state = type("App", (), {"user_role": "cliente"})()
+        object.__setattr__(
+            state,
+            "get_state",
+            AsyncMock(side_effect=[auth_state, app_state]),
+        )
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(return_value={"rating": 4}),
+        ):
+            async def consume():
+                return [
+                    event
+                    async for event in OperationalState.submit_review.fn(state)
+                ]
+
+            events = asyncio.run(consume())
+
+        self.assertIn("/home_client", str(events[-1]))
+
+    def test_existing_customer_review_can_return_to_home(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "request_id": 42,
+            "atendimento_mock": {},
+            "review_already_submitted": False,
+            "review_rating": 0,
+            "review_comment": "",
+            "review_message": "",
+        }.items():
+            object.__setattr__(state, name, value)
+        app_state = type("App", (), {"user_role": "cliente"})()
+        object.__setattr__(state, "get_state", AsyncMock(return_value=app_state))
+
+        with (
+            patch("sosdrive.OperationalState._get_auth_token", new=AsyncMock(return_value="session-token")),
+            patch(
+                "sosdrive.asyncio.to_thread",
+                new=AsyncMock(
+                    side_effect=[
+                        {"status": "confirmed"},
+                        {"rating": 5, "comment": "Atendimento ótimo"},
+                    ]
+                ),
+            ) as backend_call,
+        ):
+            asyncio.run(OperationalState.ensure_review_payment_confirmed.fn(state))
+
+        self.assertEqual(backend_call.await_count, 2)
+        self.assertTrue(state.review_already_submitted)
+        self.assertEqual(state.review_rating, 5)
+        self.assertEqual(state.review_comment, "Atendimento ótimo")
+        self.assertEqual(state.review_message, "Você já avaliou este atendimento. Obrigado!")
+
+    def test_provider_earnings_load_for_authenticated_provider(self):
+        state = OperationalState.__new__(OperationalState)
+        object.__setattr__(state, "dirty_vars", set())
+        object.__setattr__(state, "provider_earnings_balance", 0.0)
+        object.__setattr__(state, "provider_earnings_error", "")
+        app_state = type("App", (), {"user_role": "prestador"})()
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        object.__setattr__(state, "get_state", AsyncMock(side_effect=[app_state, auth_state]))
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(return_value={"balance": 116.46, "count": 2}),
+        ) as fetch_balance:
+            asyncio.run(OperationalState.load_provider_earnings.fn(state))
+
+        fetch_balance.assert_awaited_once()
+        self.assertEqual(state.provider_earnings_balance, 116.46)
+        self.assertEqual(state.provider_earnings_error, "")
+
+    def test_provider_earnings_are_not_loaded_for_customer(self):
+        state = OperationalState.__new__(OperationalState)
+        object.__setattr__(state, "dirty_vars", set())
+        object.__setattr__(state, "provider_earnings_balance", 50.0)
+        object.__setattr__(state, "provider_earnings_error", "")
+        app_state = type("App", (), {"user_role": "cliente"})()
+        object.__setattr__(state, "get_state", AsyncMock(return_value=app_state))
+
+        with patch("sosdrive.asyncio.to_thread", new=AsyncMock()) as fetch_balance:
+            asyncio.run(OperationalState.load_provider_earnings.fn(state))
+
+        fetch_balance.assert_not_awaited()
+        self.assertEqual(state.provider_earnings_balance, 0.0)
+
+    def test_payment_context_formats_service_date_and_amount_in_portuguese(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "payment_error": "",
+            "request_id": None,
+            "payment_status": "not_created",
+            "checkout_url": "",
+        }.items():
+            object.__setattr__(state, name, value)
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        object.__setattr__(state, "get_state", AsyncMock(return_value=auth_state))
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(
+                side_effect=[
+                    {
+                        "request_id": 42,
+                        "service_type": "mechanical",
+                        "estimated_price": 117.26,
+                        "distance_km": 12.419,
+                        "created_at": "2026-11-23T12:15:00Z",
+                        "provider_name": "Prestador",
+                        "vehicle_description": "Veículo",
+                    },
+                    {"status": "pending", "amount": 117.26, "checkout_url": ""},
+                ]
+            ),
+        ):
+            asyncio.run(OperationalState.load_payment_context.fn(state))
+
+        self.assertEqual(state.payment_service_name, "Mecânica")
+        self.assertEqual(state.payment_created_at, "23/11/2026")
+        self.assertEqual(state.payment_total_text, "R$ 117,26")
+        object.__setattr__(state, "provider_earnings_balance", 1250.5)
+        self.assertEqual(state.provider_earnings_balance_text, "R$ 1.250,50")
+
+    def test_payment_poll_workers_read_authentication_inside_state_lock(self):
+        async def verify_worker(worker, state_values):
+            state = OperationalState.__new__(OperationalState)
+            for name, value in {"dirty_vars": set(), **state_values}.items():
+                object.__setattr__(state, name, value)
+            object.__setattr__(state, "locked", False)
+            original_enter = OperationalState.__aenter__
+            original_exit = OperationalState.__aexit__
+
+            async def tracked_enter(current_state):
+                result = await original_enter(current_state)
+                object.__setattr__(current_state, "locked", True)
+                return result
+
+            async def tracked_exit(current_state, *args):
+                object.__setattr__(current_state, "locked", False)
+                return await original_exit(current_state, *args)
+
+            async def get_auth_token(current_state):
+                self.assertTrue(current_state.locked)
+                raise asyncio.CancelledError()
+
+            with (
+                patch.object(OperationalState, "__aenter__", new=tracked_enter),
+                patch.object(OperationalState, "__aexit__", new=tracked_exit),
+                patch.object(OperationalState, "_get_auth_token", new=get_auth_token),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker.fn(state)
+            self.assertFalse(state.locked)
+
+        asyncio.run(
+            verify_worker(
+                OperationalState.poll_customer_payment,
+                {"request_id": 42},
+            )
+        )
+        asyncio.run(
+            verify_worker(
+                OperationalState.poll_provider_payment,
+                {"request_id": 42, "atendimento_mock": {"id": 42}},
+            )
+        )
 
     def make_customer_poll_state(self):
         state = OperationalState.__new__(OperationalState)
@@ -153,6 +511,27 @@ class TestSupabaseRuntime(unittest.TestCase):
         self.assertEqual(state.client_message_draft, "Ainda estou no local")
         self.assertTrue(state.show_client_message_panel)
         self.assertEqual(state.active_message_request_id, 42)
+
+    def test_customer_completed_request_redirects_to_payment(self):
+        state = self.make_customer_poll_state()
+        object.__setattr__(state, "payment_redirect_pending", False)
+        with patch(
+            "sosdrive.fetch_service_request_supabase",
+            return_value={
+                "id": 42,
+                "status": "completed",
+                "estimated_price": 50.0,
+                "distance_km": 2.5,
+            },
+        ):
+            event = asyncio.run(
+                OperationalState.poll_service_request_status.fn(state)
+            )
+
+        self.assertIn("/payment", str(event))
+        self.assertEqual(state.request_server_status, "completed")
+        self.assertEqual(state.request_status, "completed")
+        self.assertFalse(state.payment_redirect_pending)
 
     def test_customer_request_statuses_have_safe_labels_and_actions(self):
         state = self.make_customer_poll_state()
@@ -336,6 +715,15 @@ class TestSupabaseRuntime(unittest.TestCase):
         self.assertIn("/home_client", rendered)
         self.assertIn("Voltar", rendered)
         self.assertIn("Sair", rendered)
+        self.assertIn("Ganhos confirmados", rendered)
+        self.assertIn("Saldo interno dos atendimentos pagos", rendered)
+        self.assertIn(
+            "load_provider_earnings",
+            [
+                event.handler.fn.__name__
+                for event in profile_screen().event_triggers["on_mount"].events
+            ],
+        )
 
     def test_profile_hides_vehicle_ui_for_providers_and_keeps_save_action(self):
         rendered = self.render_component(profile_screen())
@@ -1052,7 +1440,7 @@ class TestSupabaseRuntime(unittest.TestCase):
             event = asyncio.run(state.advance_atendimento_phase())
 
         complete_request.assert_called_once_with("session-token", 42)
-        self.assertIn("/service-finalized", str(event))
+        self.assertIn("/waiting-payment", str(event))
         self.assertEqual(state.available_requests, [])
         self.assertEqual(state.atendimento_phase, "CONCLUIDO")
 
@@ -1162,7 +1550,7 @@ class TestSupabaseRuntime(unittest.TestCase):
             "#FEF2F2",
         )
 
-    def test_end_service_request_completes_cleans_state_and_redirects(self):
+    def test_end_service_request_keeps_provider_waiting_for_payment(self):
         state = OperationalState.__new__(OperationalState)
         for name, value in {
             "dirty_vars": set(),
@@ -1206,11 +1594,14 @@ class TestSupabaseRuntime(unittest.TestCase):
             events = asyncio.run(consume())
 
         complete_request.assert_called_once_with("session-token", 42)
-        self.assertIn("/home_provider", str(events[-1]))
+        self.assertIn("/waiting-payment", str(events[-1]))
         self.assertEqual(state.available_requests, [])
-        self.assertEqual(state.selected_request, {})
-        self.assertEqual(state.atendimento_mock, {})
-        self.assertEqual(state.atendimento_phase, "")
+        self.assertEqual(
+            state.selected_request,
+            {"id": 42, "status": "completed", "is_active": False},
+        )
+        self.assertEqual(state.atendimento_mock, {"id": 42})
+        self.assertEqual(state.atendimento_phase, "CONCLUIDO")
         self.assertFalse(state.show_cancel_confirm)
         self.assertFalse(state.show_message_panel)
         self.assertEqual(state.service_messages, [])

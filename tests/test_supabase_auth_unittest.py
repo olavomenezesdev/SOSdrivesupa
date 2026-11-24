@@ -123,9 +123,25 @@ class TestSupabaseLogin(unittest.TestCase):
             events = consume_event_generator(state.login())
 
         self.assertEqual(events, [None])
-        self.assertEqual(state.error_message, "Sua conta não possui um tipo de usuário válido.")
+        self.assertIn("Entre em contato com o administrador", state.error_message)
         self.assertEqual(state.auth_token, "")
         self.assertFalse(state.is_loading)
+        self.assertEqual(state.password, "")
+
+    def test_login_explains_when_authenticated_user_profile_is_missing(self):
+        state = make_auth_state()
+        with patch(
+            "sosdrive.sign_in_supabase",
+            side_effect=SupabaseAuthenticationError(
+                401,
+                "Authenticated profile is unavailable",
+            ),
+        ):
+            consume_event_generator(state.login())
+
+        self.assertIn("Seu perfil ainda não está configurado", state.error_message)
+        self.assertIn("Entre em contato com o administrador", state.error_message)
+        self.assertEqual(state.auth_token, "")
         self.assertEqual(state.password, "")
 
     def test_login_requires_valid_supabase_configuration_without_network(self):

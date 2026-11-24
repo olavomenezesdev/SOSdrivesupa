@@ -23,6 +23,23 @@ class TestSupabaseMigrations(unittest.TestCase):
             [path.name for path in migration_files()],
         )
 
+    def test_provider_earnings_migration_is_confirmed_and_idempotent(self):
+        migration = next(
+            path
+            for path in migration_files()
+            if path.name == "20261123100000_provider_earnings.sql"
+        )
+        sql = migration.read_text(encoding="utf-8").lower()
+
+        self.assertIn("create table public.provider_earnings", sql)
+        self.assertIn("service_request_id bigint not null unique", sql)
+        self.assertIn("payment_id bigint not null unique", sql)
+        self.assertIn("after insert or update of status", sql)
+        self.assertIn("if new.status <> 'confirmed' then", sql)
+        self.assertIn("on conflict (service_request_id) do nothing", sql)
+        self.assertIn("payment.status = 'confirmed'", sql)
+        self.assertIn("revoke all on public.provider_earnings from anon, authenticated", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

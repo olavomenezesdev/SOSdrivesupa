@@ -13,9 +13,15 @@ import json
 import logging
 import base64
 import binascii
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from collections.abc import Callable
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Route
 
 from dotenv import load_dotenv
 from supabase_backend import (
@@ -44,6 +50,14 @@ from supabase_backend import (
     sign_in as sign_in_supabase,
     sign_up as sign_up_supabase,
     start_service_request as start_service_request_supabase,
+    create_service_payment as create_service_payment_supabase,
+    submit_service_review as submit_service_review_supabase,
+    fetch_service_review_for_request as fetch_service_review_for_request_supabase,
+    fetch_service_reviews as fetch_service_reviews_supabase,
+    fetch_provider_earnings_balance as fetch_provider_earnings_balance_supabase,
+    fetch_service_payment_status as fetch_service_payment_status_supabase,
+    fetch_service_payment_context as fetch_service_payment_context_supabase,
+    process_asaas_webhook as process_asaas_webhook_supabase,
     request_password_reset as request_password_reset_supabase,
     update_password as update_password_supabase,
     upload_profile_photo as upload_profile_photo_supabase,
@@ -1180,7 +1194,10 @@ class AuthState(rx.State):
             redirect_event = self.redirect_to_user_profile()
         except UnsupportedRoleError:
             self.clear_session()
-            self.error_message = "Sua conta não possui um tipo de usuário válido."
+            self.error_message = (
+                "Seu perfil não está configurado como cliente ou prestador. "
+                "Entre em contato com o administrador do SOS Drive."
+            )
         except SupabaseAuthenticationError as error:
             self.clear_session()
             if error.message == "Email confirmation is still enabled in Supabase Auth":
@@ -1188,6 +1205,11 @@ class AuthState(rx.State):
                 self.error_message = (
                     "Seu e-mail ainda não foi confirmado. Confirme pelo link enviado "
                     "ou reenvie a confirmação abaixo."
+                )
+            elif error.message == "Authenticated profile is unavailable":
+                self.error_message = (
+                    "Seu perfil ainda não está configurado. "
+                    "Entre em contato com o administrador do SOS Drive."
                 )
             else:
                 self.error_message = "E-mail ou senha incorretos."
@@ -1470,6 +1492,27 @@ class OperationalState(rx.State):
     # Customer Request state
     selected_service: str | None = None
     request_status: str = "idle" # idle, searching, matched, completed, cancelled, unknown
+    payment_loading: bool = False
+    payment_message: str = ""
+    payment_error: str = ""
+    payment_amount: float = 0.0
+    payment_provider_name: str = ""
+    payment_vehicle_description: str = ""
+    payment_created_at: str = ""
+    checkout_url: str = ""
+    payment_redirect_pending: bool = False
+    review_rating: int = 0
+    review_comment: str = ""
+    review_loading: bool = False
+    review_message: str = ""
+    review_error: str = ""
+    review_already_submitted: bool = False
+    review_average: float = 0.0
+    review_count: int = 0
+    review_items: list[dict] = []
+    provider_earnings_balance: float = 0.0
+    provider_earnings_error: str = ""
+    payment_status: str = "not_created"
     selected_vehicle_id: int | None = None
     selected_vehicle_option: str = ""
     pending_service_type: str = ""
@@ -1578,7 +1621,9 @@ class OperationalState(rx.State):
                         "Não foi possível localizar o chamado. Tentando novamente."
                     )
                 else:
-                    self._apply_customer_request_snapshot(request)
+                    terminal = self._apply_customer_request_snapshot(request)
+                    if terminal and request.get("status") == "completed":
+                        self.payment_redirect_pending = True
         except SupabaseBackendError as error:
             logger.error("Client request status poll failed status=%s", error.status_code)
             if error.status_code == 401:
@@ -1610,6 +1655,26 @@ class OperationalState(rx.State):
     def request_price_text(self) -> str:
         """Format the estimated price for the request confirmation."""
         return f"R$ {self.request_estimated_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    @rx.var
+    def payment_service_name(self) -> str:
+        service_names = {
+            "tire": "Troca de Pneu",
+            "battery": "Bateria",
+            "mechanical": "Mecânica",
+            "fuel": "Combustível",
+            "other": "Outro Problema",
+        }
+        return service_names.get(self.selected_service or "", "Atendimento concluído")
+
+    @rx.var
+    def payment_total_text(self) -> str:
+        amount = self.payment_amount or self.request_estimated_price
+        return f"R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    @rx.var
+    def provider_earnings_balance_text(self) -> str:
+        return f"R$ {self.provider_earnings_balance:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     @rx.var
     def request_distance_text(self) -> str:
@@ -2122,6 +2187,11 @@ class OperationalState(rx.State):
             if await self._poll_customer_request_once():
                 return AuthState.expire_session()
 
+            async with self:
+                if self.payment_redirect_pending:
+                    self.payment_redirect_pending = False
+                    return rx.redirect("/payment")
+
             await asyncio.sleep(5)
 
     def refresh_available_requests(self):
@@ -2210,6 +2280,96 @@ class OperationalState(rx.State):
         """Clear transient selection without changing provider availability."""
         self.selected_request = {}
 
+    @rx.event
+    async def ensure_provider_payment_complete(self):
+        app_state = await self.get_state(AppState)
+        if app_state.user_role != "prestador":
+            return
+        request_id = self.atendimento_mock.get("id")
+        if request_id is None:
+            return
+        token = await self._get_auth_token()
+        if not token:
+            return AuthState.expire_session()
+        try:
+            payment = await asyncio.to_thread(
+                fetch_service_payment_status_supabase,
+                token,
+                int(request_id),
+            )
+            if not payment or payment.get("status") != "confirmed":
+                return rx.redirect("/waiting-payment")
+        except SupabaseBackendError as error:
+            logger.error("Provider home payment guard failed status=%s", error.status_code)
+            self.request_poll_error = (
+                "Não foi possível verificar o pagamento. Você continuará na tela de espera."
+            )
+            return rx.redirect("/waiting-payment")
+        except requests.RequestException as error:
+            logger.error(
+                "Provider home payment guard failed category=%s",
+                type(error).__name__,
+            )
+            self.request_poll_error = (
+                "Não foi possível verificar o pagamento. Você continuará na tela de espera."
+            )
+            return rx.redirect("/waiting-payment")
+
+    @rx.event
+    async def ensure_review_payment_confirmed(self):
+        app_state = await self.get_state(AppState)
+        request_id = self.atendimento_mock.get("id") or self.request_id
+        if request_id is None:
+            return rx.redirect(
+                "/home_provider"
+                if app_state.user_role == "prestador"
+                else "/home_client"
+            )
+        request_id = int(request_id)
+        self.request_id = request_id
+        token = await self._get_auth_token()
+        if not token:
+            return AuthState.expire_session()
+        try:
+            payment = await asyncio.to_thread(
+                fetch_service_payment_status_supabase,
+                token,
+                request_id,
+            )
+            if not payment or payment.get("status") != "confirmed":
+                return rx.redirect(
+                    "/waiting-payment"
+                    if app_state.user_role == "prestador"
+                    else "/payment"
+                )
+            existing_review = await asyncio.to_thread(
+                fetch_service_review_for_request_supabase,
+                token,
+                request_id,
+            )
+            if existing_review:
+                self.review_already_submitted = True
+                self.review_rating = int(existing_review.get("rating") or 0)
+                self.review_comment = str(existing_review.get("comment") or "")
+                self.review_message = "Você já avaliou este atendimento. Obrigado!"
+        except SupabaseBackendError as error:
+            logger.error("Review payment guard failed status=%s", error.status_code)
+            return rx.redirect(
+                "/waiting-payment"
+                if app_state.user_role == "prestador"
+                else "/payment"
+            )
+        except requests.RequestException as error:
+            logger.error(
+                "Review payment guard failed category=%s",
+                type(error).__name__,
+            )
+            return rx.redirect(
+                "/waiting-payment"
+                if app_state.user_role == "prestador"
+                else "/payment"
+            )
+
     def reset_atendimento(self):
         """Clear current attendance local/mock data."""
         self.selected_request = {}
@@ -2218,7 +2378,7 @@ class OperationalState(rx.State):
         self.show_cancel_confirm = False
 
     async def encerrar_chamado(self):
-        """Complete the selected or active request and return to provider home."""
+        """Complete the selected request and keep the provider waiting for payment."""
         if self.is_ending_request:
             return
 
@@ -2265,12 +2425,18 @@ class OperationalState(rx.State):
                     for request in self.available_requests
                     if str(request.get("id")) != str(request_id)
                 ]
+                self.selected_request = {
+                    **self.selected_request,
+                    "status": "completed",
+                    "is_active": False,
+                }
+                self.atendimento_phase = "CONCLUIDO"
+                self.show_cancel_confirm = False
                 self.close_message_panel()
                 self.service_messages = []
                 self.message_draft = ""
-                self.reset_atendimento()
                 await self.refresh_provider_requests()
-                result_event = rx.redirect("/home_provider")
+                result_event = rx.redirect("/waiting-payment")
         except SupabaseBackendError as error:
             logger.error("Supabase request completion failed status=%s", error.status_code)
             if error.status_code == 401:
@@ -2460,12 +2626,12 @@ class OperationalState(rx.State):
                 if str(request.get("id")) != str(request_id)
             ]
             await self.refresh_provider_requests()
-            return rx.redirect("/service-finalized")
+            return rx.redirect("/waiting-payment")
 
     def finish_atendimento_and_back_home(self):
         """Leave finalization screen and return to provider home."""
         self.reset_atendimento()
-        return rx.redirect("/home_provider")
+        return rx.redirect("/waiting-payment")
 
     def update_provider_location(self, provider_id: int, lat: float, lng: float):
         """Update a provider's real-time location."""
@@ -2989,7 +3155,374 @@ class OperationalState(rx.State):
             return
         self.request_summary_dismissed = True
         self.request_status = "idle"
+
+    def set_review_rating(self, rating: int):
+        if 1 <= rating <= 5:
+            self.review_rating = rating
+
+    def set_review_comment(self, value: str):
+        self.review_comment = value[:500]
+
+    @rx.event
+    async def submit_review(self):
+        if self.review_loading:
+            return
+        request_id = self.atendimento_mock.get("id") or self.request_id
+        if request_id is None:
+            self.review_error = "Não foi possível identificar o chamado para enviar a avaliação."
+            return
+        try:
+            request_id = int(request_id)
+        except (TypeError, ValueError):
+            self.review_error = "Não foi possível identificar o chamado para enviar a avaliação."
+            return
+        self.request_id = request_id
+        if self.review_rating not in {1, 2, 3, 4, 5}:
+            self.review_error = "Escolha uma nota de 1 a 5."
+            return
+        self.review_loading = True
+        self.review_error = ""
+        self.review_message = ""
+        yield
+        try:
+            auth_state = await self.get_state(AuthState)
+            await asyncio.to_thread(
+                submit_service_review_supabase,
+                auth_state.auth_token,
+                request_id,
+                self.review_rating,
+                self.review_comment,
+            )
+            self.review_message = "Avaliação enviada com sucesso."
+            self.review_already_submitted = True
+            app_state = await self.get_state(AppState)
+            yield rx.redirect(
+                "/home_provider"
+                if app_state.user_role == "prestador"
+                else "/home_client"
+            )
+        except SupabaseAuthenticationError:
+            self.review_error = "A avaliação só pode ser feita pelos participantes."
+        except SupabaseBackendError as error:
+            logger.error("Review submission failed status=%s", error.status_code)
+            self.review_error = (
+                "Você já avaliou este atendimento."
+                if error.status_code == 409
+                else "Não foi possível enviar sua avaliação."
+            )
+        finally:
+            self.review_loading = False
+
+    @rx.event
+    async def load_my_reviews(self):
+        try:
+            auth_state = await self.get_state(AuthState)
+            result = await asyncio.to_thread(
+                fetch_service_reviews_supabase,
+                auth_state.auth_token,
+                auth_state.user_id,
+            )
+            self.review_average = float(result.get("average") or 0)
+            self.review_count = int(result.get("count") or 0)
+            self.review_items = result.get("reviews") or []
+        except SupabaseBackendError as error:
+            logger.error("Review loading failed status=%s", error.status_code)
+
+    @rx.event
+    async def load_provider_earnings(self):
+        app_state = await self.get_state(AppState)
+        if app_state.user_role != "prestador":
+            self.provider_earnings_balance = 0.0
+            self.provider_earnings_error = ""
+            return
+        self.provider_earnings_error = ""
+        try:
+            auth_state = await self.get_state(AuthState)
+            result = await asyncio.to_thread(
+                fetch_provider_earnings_balance_supabase,
+                auth_state.auth_token,
+            )
+            self.provider_earnings_balance = float(result.get("balance") or 0)
+        except SupabaseAuthenticationError:
+            self.provider_earnings_error = "Não foi possível autorizar a consulta do saldo."
+        except SupabaseBackendError as error:
+            logger.error("Provider earnings load failed status=%s", error.status_code)
+            self.provider_earnings_error = "Não foi possível carregar seu saldo de serviços."
+        except (requests.RequestException, TypeError, ValueError) as error:
+            logger.error(
+                "Provider earnings load failed category=%s",
+                type(error).__name__,
+            )
+            self.provider_earnings_error = "Não foi possível carregar seu saldo de serviços."
+
+    @rx.event
+    async def create_selected_payment(self):
+        if self.payment_loading or self.request_id is None:
+            return
+        self.payment_loading = True
+        self.payment_error = ""
+        self.payment_message = ""
+        yield
+        try:
+            auth_state = await self.get_state(AuthState)
+            result = await asyncio.to_thread(
+                create_service_payment_supabase,
+                auth_state.auth_token,
+                self.request_id,
+                "credit_card",
+            )
+            self.payment_amount = float(result.get("amount") or 0)
+            self.checkout_url = str(result.get("checkout_url") or "")
+            self.payment_status = str(result.get("status") or "pending")
+            self.payment_message = (
+                "Checkout seguro de cartão criado. O pagamento só será confirmado "
+                "após retorno autorizado do Asaas."
+            )
+        except SupabaseAuthenticationError:
+            self.payment_error = "Não foi possível autorizar o pagamento deste chamado."
+        except SupabaseConfigurationRuntimeError:
+            logger.error("Payment configuration is unavailable")
+            self.payment_error = (
+                "O checkout está indisponível no momento. Verifique a configuração "
+                "pública do Asaas e tente novamente."
+            )
+        except SupabaseBackendError as error:
+            logger.error("Payment creation failed status=%s", error.status_code)
+            if error.status_code == 400 and "error_codes=" in error.message:
+                error_codes = error.message.partition("error_codes=")[2]
+                code_value, _, details = error_codes.partition("; error_details=")
+                self.payment_error = (
+                    "O Asaas recusou a configuração do checkout. "
+                    f"Código técnico: {code_value or 'não informado'}. "
+                    f"Detalhe: {details or 'não informado'}. "
+                    "Confira o detalhe antes de tentar novamente."
+                )
+            else:
+                self.payment_error = "Não foi possível criar o pagamento. Tente novamente."
+        finally:
+            self.payment_loading = False
         self.request_poll_error = ""
+
+    @rx.event
+    async def load_payment_context(self):
+        self.payment_error = ""
+        try:
+            auth_state = await self.get_state(AuthState)
+            context = await asyncio.to_thread(
+                fetch_service_payment_context_supabase,
+                auth_state.auth_token,
+                self.request_id,
+            )
+            self.request_id = int(context["request_id"])
+            self.selected_service = str(context.get("service_type") or "")
+            self.request_estimated_price = float(context.get("estimated_price") or 0)
+            self.request_distance_km = float(context.get("distance_km") or 0)
+            self.payment_amount = self.request_estimated_price
+            self.payment_provider_name = str(context.get("provider_name") or "")
+            self.payment_vehicle_description = str(
+                context.get("vehicle_description") or ""
+            )
+            created_at = str(context.get("created_at") or "")
+            try:
+                self.payment_created_at = (
+                    datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime(
+                        "%d/%m/%Y"
+                    )
+                    if created_at
+                    else ""
+                )
+            except ValueError:
+                logger.warning("Payment context returned invalid creation date")
+                self.payment_created_at = ""
+            payment = await asyncio.to_thread(
+                fetch_service_payment_status_supabase,
+                auth_state.auth_token,
+                self.request_id,
+            )
+            if payment:
+                self.payment_status = str(payment.get("status") or "not_created")
+                self.checkout_url = str(payment.get("checkout_url") or "")
+                if self.payment_status == "confirmed":
+                    return rx.redirect("/review")
+                if self.payment_status in {"expired", "failed", "cancelled"}:
+                    self.checkout_url = ""
+                    self.payment_message = (
+                        "O pagamento anterior não está mais ativo. Você pode tentar novamente."
+                    )
+        except SupabaseAuthenticationError:
+            self.payment_error = "Não foi possível autorizar este chamado."
+        except SupabaseBackendError as error:
+            logger.error("Payment context loading failed status=%s", error.status_code)
+            self.request_id = None
+            self.payment_error = (
+                "Não há um chamado concluído disponível para pagamento."
+                if error.status_code == 404
+                else "Não foi possível carregar os dados do pagamento."
+            )
+        except (requests.RequestException, TypeError, ValueError) as error:
+            logger.error(
+                "Payment context loading failed category=%s",
+                type(error).__name__,
+            )
+            self.payment_error = "Não foi possível carregar os dados do pagamento."
+
+    @rx.event
+    async def refresh_payment_status(self):
+        self.payment_error = ""
+        try:
+            auth_state = await self.get_state(AuthState)
+            request_id = self.request_id
+            if request_id is None:
+                context = await asyncio.to_thread(
+                    fetch_service_payment_context_supabase,
+                    auth_state.auth_token,
+                    None,
+                )
+                request_id = int(context["request_id"])
+                self.request_id = request_id
+            result = await asyncio.to_thread(
+                fetch_service_payment_status_supabase,
+                auth_state.auth_token,
+                request_id,
+                reconcile_with_gateway=True,
+            )
+            if not result:
+                self.payment_status = "not_created"
+                self.payment_message = "Ainda não há pagamento registrado para este chamado."
+                return
+            self.payment_status = str(result.get("status") or "not_created")
+            self.payment_amount = float(result.get("amount") or 0)
+            self.checkout_url = str(result.get("checkout_url") or "")
+            if self.payment_status == "confirmed":
+                return rx.redirect("/review")
+            if self.payment_status in {"expired", "failed", "cancelled"}:
+                self.checkout_url = ""
+                self.payment_message = "O pagamento anterior não está mais ativo. Você pode tentar novamente."
+            elif self.payment_status == "pending":
+                self.payment_message = (
+                    "O Asaas ainda informa o pagamento como pendente. Só liberamos a "
+                    "avaliação após a confirmação oficial do gateway."
+                )
+            else:
+                self.payment_message = "Ainda não há pagamento registrado para este chamado."
+        except SupabaseAuthenticationError:
+            self.payment_error = "Não foi possível autorizar este chamado."
+        except SupabaseBackendError as error:
+            logger.error("Payment status refresh failed status=%s", error.status_code)
+            self.payment_error = "Não foi possível atualizar o pagamento."
+        except requests.RequestException as error:
+            logger.error(
+                "Payment status refresh failed category=%s",
+                type(error).__name__,
+            )
+            self.payment_error = "Não foi possível atualizar o pagamento."
+        except (TypeError, ValueError) as error:
+            logger.error(
+                "Payment status refresh failed category=%s",
+                type(error).__name__,
+            )
+            self.payment_error = "Não foi possível atualizar o pagamento."
+
+    @rx.event(background=True)
+    async def poll_customer_payment(self):
+        while True:
+            async with self:
+                request_id = self.request_id
+                token = await self._get_auth_token()
+            if not token:
+                return AuthState.expire_session()
+            if request_id is None:
+                try:
+                    context = await asyncio.to_thread(
+                        fetch_service_payment_context_supabase,
+                        token,
+                        None,
+                    )
+                    request_id = int(context["request_id"])
+                    async with self:
+                        self.request_id = request_id
+                except SupabaseBackendError as error:
+                    if error.status_code != 404:
+                        logger.error(
+                            "Customer payment context poll failed status=%s",
+                            error.status_code,
+                        )
+                    await asyncio.sleep(5)
+                    continue
+            try:
+                payment = await asyncio.to_thread(
+                    fetch_service_payment_status_supabase,
+                    token,
+                    int(request_id),
+                )
+                if payment:
+                    async with self:
+                        self.payment_status = str(
+                            payment.get("status") or "not_created"
+                        )
+                        self.payment_amount = float(payment.get("amount") or 0)
+                        self.checkout_url = str(payment.get("checkout_url") or "")
+                    if payment.get("status") == "confirmed":
+                        return rx.redirect("/review")
+                    if payment.get("status") in {"expired", "failed", "cancelled"}:
+                        async with self:
+                            self.checkout_url = ""
+                            self.payment_message = (
+                                "O pagamento anterior não está mais ativo. Você pode tentar novamente."
+                            )
+                        return
+            except SupabaseBackendError as error:
+                logger.error("Customer payment poll failed status=%s", error.status_code)
+                if error.status_code == 401:
+                    return AuthState.expire_session()
+            except (requests.RequestException, TypeError, ValueError) as error:
+                logger.error(
+                    "Customer payment poll failed category=%s",
+                    type(error).__name__,
+                )
+            await asyncio.sleep(5)
+
+    @rx.event(background=True)
+    async def poll_provider_payment(self):
+        """Keep the provider on the waiting page until payment is confirmed."""
+        while True:
+            async with self:
+                request_id = self.atendimento_mock.get("id") or self.request_id
+                token = await self._get_auth_token()
+            if request_id is None:
+                async with self:
+                    self.request_poll_error = "Não foi possível identificar o chamado concluído."
+                return
+            if not token:
+                return AuthState.expire_session()
+            try:
+                payment = await asyncio.to_thread(
+                    fetch_service_payment_status_supabase,
+                    token,
+                    int(request_id),
+                )
+                if payment and payment.get("status") == "confirmed":
+                    async with self:
+                        self.payment_status = "confirmed"
+                    return rx.redirect("/review")
+            except SupabaseBackendError as error:
+                logger.error("Provider payment poll failed status=%s", error.status_code)
+                if error.status_code == 401:
+                    return AuthState.expire_session()
+                async with self:
+                    self.request_poll_error = (
+                        "Não foi possível consultar o pagamento. Tentaremos novamente."
+                    )
+            except (requests.RequestException, TypeError, ValueError) as error:
+                logger.error(
+                    "Provider payment poll failed category=%s",
+                    type(error).__name__,
+                )
+                async with self:
+                    self.request_poll_error = (
+                        "Não foi possível consultar o pagamento. Tentaremos novamente."
+                    )
+            await asyncio.sleep(5)
 
     def set_provider_name(self, name: str):
         """Update the name of the current simulated provider."""
@@ -4389,12 +4922,20 @@ def customer_dashboard() -> rx.Component:
                                 ),
                             ),
                             rx.cond(
-                                (OperationalState.request_server_status == "completed")
-                                | (OperationalState.request_server_status == "cancelled"),
+                                OperationalState.request_server_status == "completed",
                                 rx.button(
-                                    "Fechar resumo",
-                                    on_click=OperationalState.clear_customer_request_summary,
-                                    class_name="customer-summary-clear-button",
+                                    "Pagar atendimento",
+                                    on_click=rx.redirect("/payment"),
+                                    class_name="primary-button",
+                                    width="100%",
+                                ),
+                                rx.cond(
+                                    OperationalState.request_server_status == "cancelled",
+                                    rx.button(
+                                        "Fechar resumo",
+                                        on_click=OperationalState.clear_customer_request_summary,
+                                        class_name="customer-summary-clear-button",
+                                    ),
                                 ),
                             ),
                             spacing="3",
@@ -4786,6 +5327,62 @@ def profile_screen() -> rx.Component:
                             align="start",
                             spacing="1",
                         ),
+                        rx.hstack(
+                            rx.icon("star", size=17, color="#F59E0B"),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.review_count > 0,
+                                    f"{OperationalState.review_average:.1f}",
+                                    "Sem avaliações",
+                                ),
+                                weight="bold",
+                                class_name="profile-summary-email",
+                            ),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.review_count > 0,
+                                    f"({OperationalState.review_count} avaliações)",
+                                    "",
+                                ),
+                                class_name="profile-summary-email",
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
+                        rx.cond(
+                            OperationalState.review_count > 0,
+                            rx.vstack(
+                                rx.heading("Avaliações recebidas", size="3"),
+                                rx.foreach(
+                                    OperationalState.review_items,
+                                    lambda review: rx.box(
+                                        rx.text(
+                                            "★ ",
+                                            review["rating"],
+                                            " de 5",
+                                            weight="bold",
+                                            color="#B45309",
+                                        ),
+                                        rx.text(
+                                            rx.cond(
+                                                review["comment"] != "",
+                                                review["comment"],
+                                                "Sem comentário.",
+                                            ),
+                                            class_name="profile-summary-email",
+                                        ),
+                                        width="100%",
+                                        padding="0.75rem",
+                                        border="1px solid #E2E8F0",
+                                        border_radius="0.75rem",
+                                        background="white",
+                                    ),
+                                ),
+                                width="100%",
+                                align="start",
+                                spacing="2",
+                            ),
+                        ),
                         rx.vstack(
                             rx.hstack(
                                 rx.text("Perfil completo"),
@@ -4986,6 +5583,42 @@ def profile_screen() -> rx.Component:
                     width="100%",
                     align="start",
                 ),
+                rx.cond(
+                    AppState.user_role == "prestador",
+                    rx.vstack(
+                        rx.hstack(
+                            rx.icon("wallet", size=20, class_name="profile-section-icon"),
+                            rx.text(
+                                "Ganhos confirmados",
+                                weight="bold",
+                                size="4",
+                                color=COLORS["navy"],
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
+                        rx.heading(
+                            OperationalState.provider_earnings_balance_text,
+                            size="6",
+                        ),
+                        rx.text(
+                            rx.cond(
+                                OperationalState.provider_earnings_error != "",
+                                OperationalState.provider_earnings_error,
+                                "Saldo interno dos atendimentos pagos; não representa transferência bancária.",
+                            ),
+                            class_name=rx.cond(
+                                OperationalState.provider_earnings_error != "",
+                                "error-message",
+                                "profile-section-subtitle",
+                            ),
+                        ),
+                        width="100%",
+                        align="start",
+                        spacing="2",
+                        class_name="profile-info-section",
+                    ),
+                ),
                 # Role Specific: Provider Specialties
                 rx.cond(
                     AppState.user_role == "prestador",
@@ -5107,7 +5740,12 @@ def profile_screen() -> rx.Component:
             OperationalState.show_vehicle_modal,
             vehicle_modal(),
         ),
-        on_mount=[AuthState.load_profile, OperationalState.load_user_vehicles],
+        on_mount=[
+            AuthState.load_profile,
+            OperationalState.load_user_vehicles,
+            OperationalState.load_my_reviews,
+            OperationalState.load_provider_earnings,
+        ],
         background="#F4F7F9",
         width="100%",
         min_height="100vh",
@@ -5653,6 +6291,7 @@ def provider_home_screen() -> rx.Component:
             class_name="provider-home-body",
         ),
         on_mount=[
+            OperationalState.ensure_provider_payment_complete,
             OperationalState.reset_provider_home,
             OperationalState.load_pending_requests,
             OperationalState.poll_pending_requests,
@@ -6400,6 +7039,500 @@ def client_message_panel() -> rx.Component:
     )
 
 
+def payment_screen() -> rx.Component:
+    return rx.box(
+        rx.box(
+            rx.hstack(
+                rx.button(
+                    rx.hstack(
+                        rx.icon("arrow-left", size=16),
+                        rx.text("Voltar"),
+                        align="center",
+                        spacing="2",
+                    ),
+                    on_click=rx.redirect("/home_client"),
+                    class_name="secondary-button",
+                    size="2",
+                ),
+                rx.hstack(
+                    rx.box("✦", class_name="brand-mark"),
+                    rx.text("SOS Drive", class_name="brand-name"),
+                    spacing="2",
+                    align="center",
+                ),
+                rx.spacer(),
+                rx.text("Atendimento concluído", class_name="top-pill"),
+                rx.box(
+                    rx.icon("user", size=18),
+                    class_name="brand-mark",
+                ),
+                justify="between",
+                align="center",
+                width="100%",
+                class_name="payment-topbar",
+            ),
+            rx.grid(
+                rx.box(
+                    rx.heading("Resumo do Atendimento", size="6"),
+                    rx.box(
+                        rx.hstack(
+                            rx.box(
+                                rx.icon("battery", size=20),
+                                class_name="payment-service-icon",
+                            ),
+                            rx.vstack(
+                                rx.text(
+                                    OperationalState.payment_service_name,
+                                    weight="bold",
+                                ),
+                                rx.text(
+                                    "Socorro mecânico ou emergência",
+                                    class_name="payment-muted",
+                                ),
+                                align="start",
+                                spacing="1",
+                            ),
+                            align="center",
+                            spacing="3",
+                        ),
+                        class_name="payment-service-card",
+                    ),
+                    rx.box(
+                        rx.hstack(
+                            rx.box(
+                                rx.icon("user", size=18),
+                                class_name="payment-provider-icon",
+                            ),
+                            rx.vstack(
+                                rx.text("Prestador do atendimento", weight="bold"),
+                                rx.text(
+                                    rx.cond(
+                                        OperationalState.payment_provider_name != "",
+                                        OperationalState.payment_provider_name,
+                                        "Prestador do atendimento",
+                                    ),
+                                    class_name="payment-muted",
+                                ),
+                                align="start",
+                                spacing="1",
+                            ),
+                            rx.spacer(),
+                            align="center",
+                            width="100%",
+                        ),
+                        class_name="payment-provider-card",
+                    ),
+                    rx.vstack(
+                        rx.hstack(
+                            rx.icon("car", size=15),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.payment_vehicle_description != "",
+                                    OperationalState.payment_vehicle_description,
+                                    "Veículo informado no chamado",
+                                ),
+                                class_name="payment-muted",
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
+                        rx.hstack(
+                            rx.icon("map-pin", size=15),
+                            rx.cond(
+                                OperationalState.request_distance_km > 0,
+                                rx.text(
+                                    "Distância: ",
+                                    OperationalState.request_distance_km,
+                                    " km",
+                                    class_name="payment-muted",
+                                ),
+                                rx.text(
+                                    "Distância informada no chamado",
+                                    class_name="payment-muted",
+                                ),
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
+                        rx.hstack(
+                            rx.icon("calendar", size=15),
+                            rx.text(
+                                rx.cond(
+                                    OperationalState.payment_created_at != "",
+                                    OperationalState.payment_created_at,
+                                    "Data do chamado",
+                                ),
+                                class_name="payment-muted",
+                            ),
+                            align="center",
+                            spacing="2",
+                        ),
+                        align="start",
+                        spacing="2",
+                        width="100%",
+                    ),
+                    rx.divider(),
+                    rx.hstack(
+                        rx.text("Valor do atendimento"),
+                        rx.spacer(),
+                        rx.text(
+                            OperationalState.payment_total_text,
+                            weight="bold",
+                        ),
+                        width="100%",
+                    ),
+                    rx.hstack(
+                        rx.heading("Total", size="5"),
+                        rx.spacer(),
+                        rx.heading(
+                            OperationalState.payment_total_text,
+                            size="5",
+                        ),
+                        width="100%",
+                    ),
+                    rx.text(
+                        "Atendimento concluído pelo prestador",
+                        class_name="payment-muted",
+                    ),
+                    width="100%",
+                    spacing="4",
+                    class_name="payment-summary-card",
+                ),
+                rx.box(
+                    rx.heading("Forma de Pagamento", size="6"),
+                    rx.grid(
+                        rx.button(
+                            rx.vstack(
+                                rx.icon("credit-card", size=20),
+                                rx.text("Cartão de Crédito", weight="bold"),
+                                rx.text(
+                                    "Checkout seguro Asaas",
+                                    class_name="payment-option-detail",
+                                ),
+                                spacing="1",
+                                align="center",
+                            ),
+                            disabled=(OperationalState.checkout_url != "")
+                            | (OperationalState.payment_status == "pending"),
+                            class_name="payment-method-card selected",
+                        ),
+                        columns="1",
+                        width="100%",
+                        gap="2",
+                        class_name="payment-method-grid",
+                    ),
+                    rx.box(
+                        rx.text(
+                            "O checkout seguro do Asaas coletará os dados do cartão, "
+                            "sem que eles passem pelo SOS Drive.",
+                            class_name="payment-muted",
+                        ),
+                        rx.cond(
+                            OperationalState.checkout_url != "",
+                            rx.link(
+                                "Continuar no checkout seguro",
+                                href=OperationalState.checkout_url,
+                                is_external=True,
+                                class_name="primary-button action-button",
+                                width="100%",
+                                text_align="center",
+                            ),
+                        ),
+                        class_name="payment-checkout-panel",
+                    ),
+                    rx.cond(
+                        OperationalState.payment_error != "",
+                        rx.text(
+                            OperationalState.payment_error,
+                            class_name="error-message",
+                        ),
+                    ),
+                    rx.cond(
+                        OperationalState.payment_message != "",
+                        rx.text(
+                            OperationalState.payment_message,
+                            class_name=rx.cond(
+                                OperationalState.payment_status == "confirmed",
+                                "success-message",
+                                "payment-muted",
+                            ),
+                        ),
+                    ),
+                    rx.text(
+                        rx.cond(
+                            OperationalState.payment_status == "confirmed",
+                            "Status: confirmado",
+                            rx.cond(
+                                OperationalState.payment_status == "pending",
+                                "Status: aguardando confirmação",
+                                rx.cond(
+                                    OperationalState.payment_status == "expired",
+                                    "Status: expirado",
+                                    rx.cond(
+                                        OperationalState.payment_status == "cancelled",
+                                        "Status: cancelado",
+                                        rx.cond(
+                                            OperationalState.payment_status == "failed",
+                                            "Status: não aprovado",
+                                            "Status: pagamento não iniciado",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        class_name="payment-muted",
+                        role="status",
+                    ),
+                    rx.hstack(
+                        rx.text("Total a pagar:", weight="bold"),
+                        rx.spacer(),
+                        rx.heading(
+                            OperationalState.payment_total_text,
+                            size="5",
+                        ),
+                        width="100%",
+                    ),
+                    rx.cond(
+                        OperationalState.payment_status != "pending",
+                        rx.button(
+                            rx.cond(
+                                OperationalState.payment_loading,
+                                "Processando...",
+                                "Gerar checkout seguro",
+                            ),
+                            on_click=OperationalState.create_selected_payment,
+                            class_name="primary-button",
+                            width="100%",
+                            disabled=OperationalState.payment_loading,
+                        ),
+                    ),
+                    rx.cond(
+                        OperationalState.payment_status == "confirmed",
+                        rx.link(
+                            "Avaliar atendimento",
+                            href="/review",
+                            class_name="primary-button action-button",
+                            width="100%",
+                            text_align="center",
+                        ),
+                    ),
+                    rx.button(
+                        "Atualizar status do pagamento",
+                        on_click=OperationalState.refresh_payment_status,
+                        class_name="secondary-button",
+                        width="100%",
+                    ),
+                    rx.text(
+                        "Pagamento seguro - Processado pelo Asaas",
+                        class_name="payment-security",
+                        text_align="center",
+                    ),
+                    width="100%",
+                    spacing="4",
+                    class_name="payment-form-card",
+                ),
+                columns="minmax(300px, 0.9fr) minmax(420px, 1.4fr)",
+                width="100%",
+                gap="5",
+                class_name="payment-layout",
+            ),
+            width="100%",
+            min_height="100vh",
+            padding="1.5rem clamp(1rem, 3vw, 3rem)",
+            background="#F3F6FB",
+            class_name="payment-page",
+        ),
+        on_mount=[
+            OperationalState.load_payment_context,
+            OperationalState.poll_customer_payment,
+        ],
+        width="100%",
+    )
+
+
+def waiting_payment_screen() -> rx.Component:
+    return rx.center(
+        rx.vstack(
+            rx.box(
+                rx.icon("clock", size=34),
+                class_name="payment-waiting-card",
+            ),
+            rx.heading("Aguardando pagamento", size="7"),
+            rx.text(
+                "O pagamento do cliente ainda não foi confirmado. "
+                "Você poderá voltar para novos chamados após a confirmação.",
+                class_name="section-intro",
+                text_align="center",
+            ),
+            rx.box(
+                rx.text("Chamado concluído", weight="bold"),
+                rx.text(
+                    rx.cond(
+                        OperationalState.atendimento_mock,
+                        f"Cliente: {OperationalState.atendimento_mock['nome']}",
+                        "Cliente: -",
+                    ),
+                    class_name="payment-muted",
+                ),
+                rx.text(
+                    rx.cond(
+                        OperationalState.atendimento_mock,
+                        f"Serviço: {OperationalState.atendimento_mock['tipo_problema']}",
+                        "Serviço: -",
+                    ),
+                    class_name="payment-muted",
+                ),
+                width="100%",
+                spacing="2",
+                class_name="payment-waiting-card",
+            ),
+            rx.cond(
+                OperationalState.request_poll_error != "",
+                rx.text(
+                    OperationalState.request_poll_error,
+                    class_name="error-message",
+                    text_align="center",
+                ),
+            ),
+            rx.button(
+                "Ainda aguardando confirmação",
+                disabled=True,
+                class_name="secondary-button",
+                width="100%",
+            ),
+            spacing="5",
+            width="min(100%, 38rem)",
+            align="center",
+            class_name="login-panel",
+        ),
+        min_height="100vh",
+        padding="1rem",
+        background=COLORS["background"],
+        on_mount=OperationalState.poll_provider_payment,
+    )
+
+
+def review_screen() -> rx.Component:
+    return rx.center(
+        rx.vstack(
+            rx.text("Pagamento confirmado", class_name="section-kicker"),
+            rx.heading("Como foi o atendimento?", size="7"),
+            rx.text(
+                "Avalie a outra parte. Sua avaliação aparecerá no perfil.",
+                class_name="section-intro",
+                text_align="center",
+            ),
+            rx.cond(
+                OperationalState.review_already_submitted,
+                rx.vstack(
+                    rx.text(
+                        "Sua avaliação já foi registrada",
+                        weight="bold",
+                    ),
+                    rx.text(
+                        "★ ",
+                        OperationalState.review_rating,
+                        " de 5",
+                        color="#B45309",
+                        weight="bold",
+                    ),
+                    rx.text(
+                        rx.cond(
+                            OperationalState.review_comment != "",
+                            OperationalState.review_comment,
+                            "Sem comentário.",
+                        ),
+                        class_name="payment-muted",
+                    ),
+                    width="100%",
+                    spacing="2",
+                    class_name="payment-waiting-card",
+                ),
+                rx.vstack(
+                    rx.hstack(
+                        *[
+                            rx.button(
+                                rx.icon("star", size=28),
+                                on_click=OperationalState.set_review_rating(rating),
+                                class_name="review-star-button",
+                                type="button",
+                                color=rx.cond(
+                                    OperationalState.review_rating >= rating,
+                                    "#F59E0B",
+                                    "#CBD5E1",
+                                ),
+                                background="transparent",
+                                border="0",
+                            )
+                            for rating in range(1, 6)
+                        ],
+                        justify="center",
+                        width="100%",
+                    ),
+                    rx.text_area(
+                        placeholder="Deixe um comentário opcional",
+                        value=OperationalState.review_comment,
+                        on_change=OperationalState.set_review_comment,
+                        min_height="7rem",
+                        width="100%",
+                    ),
+                    rx.cond(
+                        OperationalState.review_error != "",
+                        rx.text(
+                            OperationalState.review_error,
+                            class_name="error-message",
+                        ),
+                    ),
+                    rx.button(
+                        rx.cond(
+                            OperationalState.review_loading,
+                            "Enviando...",
+                            "Enviar avaliação",
+                        ),
+                        on_click=OperationalState.submit_review,
+                        class_name="primary-button",
+                        width="100%",
+                        disabled=OperationalState.review_loading,
+                    ),
+                    width="100%",
+                    spacing="4",
+                ),
+            ),
+            rx.cond(
+                OperationalState.review_message != "",
+                rx.text(OperationalState.review_message, class_name="success-message"),
+            ),
+            rx.cond(
+                OperationalState.review_already_submitted,
+                rx.link(
+                    "Voltar para meus chamados",
+                    href=rx.cond(
+                        AppState.user_role == "prestador",
+                        "/home_provider",
+                        "/home_client",
+                    ),
+                    class_name="primary-button action-button",
+                    width="100%",
+                    text_align="center",
+                ),
+            ),
+            rx.link(
+                "Ir para meu perfil",
+                href="/profile",
+                class_name="secondary-button action-button",
+                width="100%",
+            ),
+            width="100%",
+            spacing="4",
+            class_name="review-card",
+        ),
+        min_height="100vh",
+        padding="1rem",
+        background=COLORS["background"],
+        on_mount=OperationalState.ensure_review_payment_confirmed,
+    )
+
+
 def service_finalized_screen() -> rx.Component:
     """Simple finalization summary after completing attendance."""
     return rx.center(
@@ -6407,7 +7540,7 @@ def service_finalized_screen() -> rx.Component:
             rx.text("atendimento finalizado", class_name="section-kicker"),
             rx.heading("Chamado concluído com sucesso", class_name="section-title", size="7"),
             rx.text(
-                "O atendimento foi encerrado e você já pode aceitar novos chamados.",
+                "O atendimento foi encerrado. Aguarde a confirmação do pagamento do cliente.",
                 class_name="section-intro",
                 text_align="center",
             ),
@@ -6444,7 +7577,7 @@ def service_finalized_screen() -> rx.Component:
                 width="100%",
             ),
             rx.button(
-                "Voltar para Home do Colaborador",
+                "Acompanhar pagamento",
                 on_click=OperationalState.finish_atendimento_and_back_home,
                 class_name="primary-button",
                 width="100%",
@@ -6457,6 +7590,7 @@ def service_finalized_screen() -> rx.Component:
         min_height="100vh",
         padding="1rem",
         background=COLORS["background"],
+        on_mount=OperationalState.ensure_provider_payment_complete,
     )
 
 
@@ -6482,7 +7616,68 @@ def protected_page(page: Callable[[], rx.Component]) -> rx.Component:
     )
 
 
+async def asaas_webhook(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        received_token = request.headers.get("asaas-access-token", "")
+        result = process_asaas_webhook_supabase(payload, received_token)
+        return JSONResponse(result, status_code=200)
+    except SupabaseAuthenticationError:
+        logger.warning("Asaas webhook rejected because its authentication token is invalid")
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    except SupabaseConfigurationRuntimeError:
+        logger.error("Asaas webhook is unavailable because server configuration is incomplete")
+        return JSONResponse({"detail": "Webhook unavailable"}, status_code=503)
+    except SupabaseBackendError as error:
+        logger.error("Asaas webhook rejected status=%s", error.status_code)
+        return JSONResponse({"detail": "Webhook rejected"}, status_code=min(error.status_code, 599))
+    except Exception:
+        logger.exception("Asaas webhook processing failed")
+        return JSONResponse({"detail": "Webhook processing failed"}, status_code=500)
+
+
+async def asaas_checkout_return(request: Request) -> JSONResponse | RedirectResponse:
+    result = request.path_params.get("result")
+    if result not in {"success", "cancel", "expired"}:
+        return JSONResponse({"detail": "Invalid checkout return"}, status_code=400)
+
+    frontend_url = os.getenv(
+        "ASAAS_CHECKOUT_FRONTEND_URL",
+        "http://localhost:3000",
+    ).strip().rstrip("/")
+    try:
+        parsed_frontend_url = urlsplit(frontend_url)
+        valid_frontend_url = (
+            parsed_frontend_url.scheme in {"http", "https"}
+            and bool(parsed_frontend_url.hostname)
+            and parsed_frontend_url.username is None
+            and parsed_frontend_url.password is None
+            and not parsed_frontend_url.query
+            and not parsed_frontend_url.fragment
+        )
+    except ValueError:
+        valid_frontend_url = False
+    if not valid_frontend_url:
+        logger.error("Asaas checkout frontend return URL is invalid")
+        return JSONResponse({"detail": "Checkout return unavailable"}, status_code=503)
+
+    return RedirectResponse(f"{frontend_url}/payment", status_code=303)
+
+
+payment_api = Starlette(
+    routes=[
+        Route("/api/asaas/webhook", asaas_webhook, methods=["POST"]),
+        Route(
+            "/api/asaas/checkout-return/{result}",
+            asaas_checkout_return,
+            methods=["GET"],
+        ),
+    ],
+)
+
+
 app = rx.App(
+    api_transformer=payment_api,
     style=GLOBAL_STYLE,
     head_components=[
         rx.el.link(
@@ -6746,6 +7941,9 @@ app.add_page(lambda: protected_page(provider_home_screen), route="/home_provider
 app.add_page(lambda: protected_page(service_details_screen), route="/service-details", title="Detalhes do Atendimento | SOS Drive")
 app.add_page(lambda: protected_page(provider_service_progress_screen), route="/provider-service-progress", title="Atendimento em Andamento | SOS Drive")
 app.add_page(lambda: protected_page(service_finalized_screen), route="/service-finalized", title="Chamado Finalizado | SOS Drive")
+app.add_page(lambda: protected_page(payment_screen), route="/payment", title="Pagamento do Atendimento | SOS Drive")
+app.add_page(lambda: protected_page(review_screen), route="/review", title="Avaliar Atendimento | SOS Drive")
+app.add_page(lambda: protected_page(waiting_payment_screen), route="/waiting-payment", title="Aguardando Pagamento | SOS Drive")
 app.add_page(lambda: protected_page(profile_screen), route="/profile", title="Meu Perfil | SOS Drive")
 app.add_page(lambda: protected_page(profile_screen), route="/perfil-cliente", title="Perfil Cliente | SOS Drive")
 app.add_page(lambda: protected_page(profile_screen), route="/perfil-prestador", title="Perfil Prestador | SOS Drive")

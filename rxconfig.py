@@ -4,6 +4,7 @@ import ipaddress
 import os
 
 import reflex as rx
+from reflex.plugins import SitemapPlugin
 
 
 demo_host = os.getenv("SOSDRIVE_DEMO_HOST", "").strip()
@@ -24,5 +25,6 @@ if demo_host:
 
 config = rx.Config(
     app_name="sosdrive_app",
+    plugins=[SitemapPlugin()],
     **demo_config,
 )

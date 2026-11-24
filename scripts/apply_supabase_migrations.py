@@ -22,6 +22,9 @@ TARGET_TABLES = (
     "service_request_acceptance",
     "service_messages",
     "event_log",
+    "service_request_payments",
+    "service_request_reviews",
+    "provider_earnings",
 )
 
 
