@@ -4,7 +4,7 @@ Experiência web **mobile-first** desenvolvida em **Python + Reflex** para conec
 
 <p align="center">
   <!-- IMAGEM 01: Banner ou captura da página inicial pública (Landing Page) -->
-  <img src="./assets/docs/01-landing-page.png" alt="Tela inicial pública do SOS Drive" width="800" />
+  <img src="./assets/pagina-inicial.png" alt="Tela inicial pública do SOS Drive" width="600" />
 </p>
 
 ---
@@ -218,7 +218,7 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 02: Telas de Cadastro e Login -->
-  <img src="./assets/docs/02-autenticacao-cadastro-login.png" alt="Telas de cadastro, login e recuperação de senha" width="750" />
+  <img src="./assets/tela-login.png" alt="Telas de cadastro, login e recuperação de senha" width="600" />
 </p>
 
 ---
@@ -231,7 +231,8 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 03: Home do Cliente, Perfil e Cadastro de Veículos -->
-  <img src="./assets/docs/03-cliente-home-veiculos.png" alt="Home do cliente e gerenciamento de veículos" width="750" />
+  <img src="./assets/tela-perfil.png" alt="Home do cliente e gerenciamento de veículos" width="400" />
+  <img src="./assets/tela-adicinarvei.png" alt="Home do cliente e gerenciamento de veículos" width="200" />
 </p>
 
 #### Solicitação de Assistência e Pagamento
@@ -242,10 +243,10 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 04: Painel de solicitação de socorro e estimativa -->
-  <img src="./assets/docs/04-cliente-solicitar-socorro.png" alt="Tela de solicitação de assistência veicular" width="360" />
+  <img src="./assets/tela-inicialcliente.png" alt="Tela de solicitação de assistência veicular" width="360" />
   &nbsp;&nbsp;
   <!-- IMAGEM 05: Confirmação do pagamento realizado -->
-  <img src="./assets/docs/05-cliente-confirmacao-pagamento.png" alt="Confirmação do pagamento realizado" width="360" />
+  <img src="./assets/tela-pagamento.png" alt="Confirmação do pagamento realizado" width="360" />
 </p>
 
 #### Acompanhamento, Chat, Cancelamento e Avaliação
@@ -256,10 +257,10 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 06: Acompanhamento do chamado e chat com o prestador -->
-  <img src="./assets/docs/06-cliente-acompanhamento-chat.png" alt="Acompanhamento do chamado e chat" width="360" />
+  <img src="./assets/tela-menssagem.png" alt="Acompanhamento do chamado e chat" width="360" />
   &nbsp;&nbsp;
   <!-- IMAGEM 07: Avaliação do Prestador de Serviço -->
-  <img src="./assets/docs/07-cliente-avaliacao-prestador.png" alt="Formulário de avaliação do prestador" width="360" />
+  <img src="./assets/tela-avaliacao.png" alt="Formulário de avaliação do prestador" width="360" />
 </p>
 
 ---
@@ -273,7 +274,7 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 08: Home do Prestador com mapa, disponibilidade e fila de chamados -->
-  <img src="./assets/docs/08-prestador-home-chamados.png" alt="Home do prestador com disponibilidade e solicitações próximas" width="750" />
+  <img src="./assets/chamado-recebido.png" alt="Home do prestador com disponibilidade e solicitações próximas" width="750" />
 </p>
 
 #### Deslocamento, Atendimento, Liberação e Conclusão
@@ -284,7 +285,7 @@ Confirme `TcpTestSucceeded : True` e respostas HTTP válidas antes de abrir `htt
 
 <p align="center">
   <!-- IMAGEM 09: Atendimento em andamento, rota e aviso de chegada -->
-  <img src="./assets/docs/09-prestador-atendimento-rota.png" alt="Tela de atendimento em andamento com mapa e mensagens" width="750" />
+  <img src="./assets/tela-cancelarprestador.png" alt="Tela de atendimento em andamento com mapa e mensagens" width="750" />
 </p>
 
 #### Avaliação do Cliente / Motorista
@@ -292,11 +293,8 @@ Após concluir o atendimento, o prestador acessa a opção de avaliação na tel
 
 <p align="center">
   <!-- IMAGEM 10: Opção de avaliação do cliente após a conclusão do atendimento -->
-  <img src="./assets/docs/10-prestador-opcao-avaliacao.png" alt="Opção de avaliação do cliente após conclusão do atendimento" width="360" />
+  <img src="./assets/tela-avaliacao.png" alt="Opção de avaliação do cliente após conclusão do atendimento" width="360" />
   &nbsp;&nbsp;
-  <!-- IMAGEM 11: Formulário de avaliação do Cliente/Motorista -->
-  <img src="./assets/docs/11-prestador-formulario-avaliacao.png" alt="Formulário de avaliação do Cliente/Motorista" width="360" />
-</p>
 
 ---
 
