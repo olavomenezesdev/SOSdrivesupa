@@ -1,4 +1,4 @@
-"""Privacy safeguards for legacy Xano data migration."""
+"""Privacy safeguards for event metadata."""
 
 from __future__ import annotations
 

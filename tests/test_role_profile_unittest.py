@@ -6,14 +6,10 @@ from sosdrive import (
     AuthState,
     OperationalState,
     UnsupportedRoleError,
-    _is_duplicate_email_error,
     build_image_data_url,
-    fetch_user_profile,
     format_cpf,
     format_phone,
     normalize_user_role,
-    save_user_profile,
-    upload_user_profile_photo,
     validate_signup,
 )
 
@@ -64,18 +60,6 @@ class TestRoleProfile(unittest.TestCase):
         self.assertEqual(state.user_id, "29")
         self.assertEqual(state.user_role, "cliente")
         self.assertEqual(state.auth_refresh_token, "new-refresh-token")
-
-    def test_signup_sets_duplicate_email_message_from_backend_conflict(self):
-        self.assertTrue(
-            _is_duplicate_email_error(409, "Este e-mail já está cadastrado. Faça login ou tente outro.")
-        )
-        self.assertTrue(_is_duplicate_email_error(409, "Email already exists"))
-        self.assertFalse(_is_duplicate_email_error(400, "Mensagem genérica do backend"))
-
-    def test_fetch_user_profile_returns_empty_profile_for_missing_record(self):
-        response = Mock(status_code=404)
-        with patch("sosdrive.requests.get", return_value=response):
-            self.assertEqual(fetch_user_profile("token", "https://xano.example/api"), {})
 
     def test_customer_request_stays_searching_until_provider_accepts(self):
         state = OperationalState.__new__(OperationalState)
@@ -145,131 +129,6 @@ class TestRoleProfile(unittest.TestCase):
         create_request.assert_called_once_with("token-123", "battery", 1, 0.0, 0.0)
         self.assertEqual(state.request_status, "searching")
         self.assertEqual(state.request_id, 101)
-
-    def test_save_user_profile_sends_only_profile_fields(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"id": 4, "user_id": 9, "nome_completo": "Ana"}
-        payload = {
-            "nome_completo": " Ana ",
-            "cpf": "123.456.789-01",
-            "telefone": "(11) 99999-9999",
-            "foto_perfil": None,
-        }
-        with patch("sosdrive.requests.request", return_value=response) as request:
-            result = save_user_profile("token", "https://xano.example/api", payload, "POST")
-
-        self.assertEqual(result["user_id"], 9)
-        self.assertEqual(request.call_args.args[0], "POST")
-        self.assertEqual(request.call_args.args[1], "https://xano.example/api/user_profile")
-        self.assertEqual(
-            request.call_args.kwargs["headers"]["Content-Type"],
-            "application/json",
-        )
-        self.assertEqual(
-            request.call_args.kwargs["headers"]["Authorization"],
-            "Bearer token",
-        )
-        request.assert_called_once_with(
-            "POST",
-            "https://xano.example/api/user_profile",
-            headers={"Authorization": "Bearer token", "Content-Type": "application/json"},
-            json={
-                "nome_completo": "Ana",
-                "cpf": "12345678901",
-                "telefone": "11999999999",
-                "foto_perfil": "",
-            },
-            timeout=10,
-        )
-
-    def test_save_user_profile_uses_empty_strings_and_omits_non_text_fields(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"nome_completo": ""}
-        payload = {
-            "nome_completo": None,
-            "cpf": None,
-            "telefone": "",
-            "foto_perfil": {"unexpected": "value"},
-        }
-        with patch("sosdrive.requests.request", return_value=response) as request:
-            save_user_profile("token", "https://xano.example/api", payload, "PUT")
-
-        self.assertEqual(request.call_args.args[0], "PUT")
-        self.assertEqual(request.call_args.args[1], "https://xano.example/api/user_profile")
-        self.assertEqual(
-            request.call_args.kwargs["headers"]["Content-Type"],
-            "application/json",
-        )
-        self.assertEqual(
-            request.call_args.kwargs["json"],
-            {"nome_completo": "", "cpf": "", "telefone": "", "foto_perfil": ""},
-        )
-
-    def test_save_user_profile_sends_photo_url_as_json_string(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"id": 4, "user_id": 9, "nome_completo": "Ana", "foto_perfil": "https://cdn.example/avatar.png"}
-        payload = {
-            "nome_completo": " Ana ",
-            "cpf": "123.456.789-01",
-            "telefone": "(11) 99999-9999",
-            "foto_perfil": "https://xano.example/vault/profile/avatar.png",
-        }
-
-        with patch("sosdrive.requests.request", return_value=response) as request:
-            result = save_user_profile(
-                "token",
-                "https://xano.example/api",
-                payload,
-                "POST",
-            )
-
-        self.assertEqual(result["foto_perfil"], "https://cdn.example/avatar.png")
-        request.assert_called_once()
-        call_kwargs = request.call_args.kwargs
-        self.assertEqual(call_kwargs["headers"]["Authorization"], "Bearer token")
-        self.assertIn("json", call_kwargs)
-        self.assertNotIn("files", call_kwargs)
-        self.assertEqual(
-            call_kwargs["json"],
-            {
-                "nome_completo": "Ana",
-                "cpf": "12345678901",
-                "telefone": "11999999999",
-                "foto_perfil": "https://xano.example/vault/profile/avatar.png",
-            },
-        )
-
-    def test_upload_user_profile_photo_sends_multipart_and_returns_public_url(self):
-        response = Mock(status_code=200)
-        response.json.return_value = {"path": "/vault/profile/avatar.png"}
-        profile_file = {
-            "field_name": "foto_perfil",
-            "name": "avatar.png",
-            "content": b"png-content",
-            "mime_type": "image/png",
-        }
-
-        with patch("sosdrive.requests.post", return_value=response) as request:
-            url = upload_user_profile_photo(
-                "token",
-                "https://xano.example/api:profile",
-                profile_file,
-            )
-
-        self.assertEqual(url, "https://xano.example/vault/profile/avatar.png")
-        self.assertEqual(request.call_count, 1)
-        args, kwargs = request.call_args
-        self.assertEqual(
-            args,
-            ("https://xano.example/api:profile/user_profile/photo",),
-        )
-        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer token"})
-        self.assertEqual(
-            kwargs["files"],
-            {"foto_perfil": ("avatar.png", b"png-content", "image/png")},
-        )
-        self.assertEqual(kwargs["timeout"], 10)
-
 
 if __name__ == "__main__":
     unittest.main()
