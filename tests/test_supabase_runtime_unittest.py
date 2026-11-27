@@ -168,6 +168,48 @@ class TestSupabaseRuntime(unittest.TestCase):
         self.assertIn("Asaas", state.payment_message)
         self.assertEqual(state.payment_error, "")
 
+    def test_confirmed_mock_payment_redirects_to_existing_review_step(self):
+        state = OperationalState.__new__(OperationalState)
+        for name, value in {
+            "dirty_vars": set(),
+            "request_id": 42,
+            "payment_loading": False,
+            "payment_error": "",
+            "payment_message": "",
+            "payment_amount": 0.0,
+            "payment_status": "not_created",
+            "checkout_url": "",
+            "request_poll_error": "",
+        }.items():
+            object.__setattr__(state, name, value)
+        auth_state = type("Auth", (), {"auth_token": "session-token"})()
+        object.__setattr__(state, "get_state", AsyncMock(return_value=auth_state))
+
+        with patch(
+            "sosdrive.asyncio.to_thread",
+            new=AsyncMock(
+                return_value={
+                    "status": "confirmed",
+                    "payment_method": "credit_card",
+                    "amount": 57.84,
+                    "checkout_url": "",
+                }
+            ),
+        ) as create_payment:
+            async def consume():
+                return [
+                    event
+                    async for event in OperationalState.create_selected_payment.fn(state)
+                ]
+
+            events = asyncio.run(consume())
+
+        create_payment.assert_awaited_once()
+        self.assertEqual(state.payment_status, "confirmed")
+        self.assertEqual(state.checkout_url, "")
+        self.assertEqual(state.payment_message, "Pagamento de teste aprovado.")
+        self.assertIn("/review", str(events[-1]))
+
     def test_provider_can_submit_review_using_attendance_request_id(self):
         state = OperationalState.__new__(OperationalState)
         for name, value in {

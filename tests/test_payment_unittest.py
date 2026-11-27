@@ -7,6 +7,7 @@ import zlib
 
 from supabase_backend import (
     SupabaseBackendError,
+    _mock_payment_mode_enabled,
     create_service_payment,
     fetch_provider_earnings_balance,
     fetch_service_payment_status,
@@ -31,12 +32,33 @@ def _request_client(request_row):
 
 class TestServicePayment(unittest.TestCase):
     def setUp(self):
+        self.payment_mode_patcher = patch.dict(
+            os.environ,
+            {"APP_ENV": "production", "PAYMENT_MODE": "asaas"},
+        )
+        self.payment_mode_patcher.start()
+        self.addCleanup(self.payment_mode_patcher.stop)
         self.checkout_url_patcher = patch.dict(
             os.environ,
             {"ASAAS_CHECKOUT_RETURN_URL": "https://api.example.com"},
         )
         self.checkout_url_patcher.start()
         self.addCleanup(self.checkout_url_patcher.stop)
+
+    def test_mock_payment_mode_requires_explicit_nonproduction_configuration(self):
+        scenarios = (
+            ({"PAYMENT_MODE": "mock", "APP_ENV": "development"}, True),
+            ({"PAYMENT_MODE": "mock", "APP_ENV": "test"}, True),
+            ({"PAYMENT_MODE": "mock", "APP_ENV": "production"}, False),
+            ({"PAYMENT_MODE": "asaas", "APP_ENV": "test"}, False),
+            ({"PAYMENT_MODE": "mock"}, False),
+            ({"PAYMENT_MODE": "mock", "APP_ENV": "unknown"}, False),
+            ({}, False),
+        )
+        for environment, expected in scenarios:
+            with self.subTest(environment=environment):
+                with patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(_mock_payment_mode_enabled(), expected)
 
     def _payment_status_clients(self, amount="91.06"):
         auth_client = _request_client(
@@ -277,6 +299,164 @@ class TestServicePayment(unittest.TestCase):
         self.assertNotIn("creditCard", payload)
         self.assertNotIn("creditCardHolderInfo", payload)
         self.assertEqual(result["checkout_url"], response.json.return_value["link"])
+
+    def test_mock_payment_is_confirmed_by_backend_without_asaas_checkout(self):
+        request_row = {
+            "id": 123,
+            "user_id": CUSTOMER_ID,
+            "provider_id": PROVIDER_ID,
+            "estimated_price": "57.84",
+            "status": "completed",
+        }
+        client = _request_client(request_row)
+        service_client = Mock()
+        service_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = []
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ENV": "development", "PAYMENT_MODE": "mock"},
+            ),
+            patch("supabase_backend._authenticated_client", return_value=client),
+            patch("supabase_backend._service_client", return_value=service_client),
+            patch("supabase_backend._asaas_settings") as asaas_settings,
+            patch("supabase_backend.requests.post") as asaas_post,
+            patch("supabase_backend.requests.get") as asaas_get,
+        ):
+            result = create_service_payment("access-token", 123, "credit_card")
+
+        persisted_payment = service_client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["amount"], 57.84)
+        self.assertEqual(result["checkout_url"], "")
+        self.assertEqual(persisted_payment["gateway"], "mock")
+        self.assertEqual(persisted_payment["status"], "confirmed")
+        self.assertIsNone(persisted_payment["gateway_checkout_id"])
+        self.assertIsNone(persisted_payment["checkout_url"])
+        self.assertEqual(persisted_payment["gateway_payload"], {"mode": "mock"})
+        asaas_settings.assert_not_called()
+        asaas_post.assert_not_called()
+        asaas_get.assert_not_called()
+
+    def test_mock_payment_replaces_pending_checkout_and_preserves_authorization(self):
+        request_row = {
+            "id": 123,
+            "user_id": CUSTOMER_ID,
+            "provider_id": PROVIDER_ID,
+            "estimated_price": "57.84",
+            "status": "completed",
+        }
+        client = _request_client(request_row)
+        service_client = Mock()
+        service_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {
+                "status": "pending",
+                "checkout_url": "https://checkout.example",
+                "payment_method": "credit_card",
+            }
+        ]
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ENV": "test", "PAYMENT_MODE": "mock"},
+            ),
+            patch("supabase_backend._authenticated_client", return_value=client),
+            patch("supabase_backend._service_client", return_value=service_client),
+            patch("supabase_backend.requests.post") as asaas_post,
+            patch("supabase_backend.requests.get") as asaas_get,
+        ):
+            result = create_service_payment("access-token", 123, "credit_card")
+
+        persisted_payment = service_client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(result["status"], "confirmed")
+        self.assertIsNone(persisted_payment["checkout_url"])
+        asaas_post.assert_not_called()
+        asaas_get.assert_not_called()
+
+    def test_production_uses_asaas_even_when_mock_is_requested(self):
+        request_row = {
+            "id": 123,
+            "user_id": CUSTOMER_ID,
+            "provider_id": PROVIDER_ID,
+            "estimated_price": "57.84",
+            "status": "completed",
+        }
+        client = _request_client(request_row)
+        service_client = Mock()
+        service_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = []
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "id": "checkout-production",
+            "link": "https://sandbox.asaas.com/checkoutSession/show/checkout-production",
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ENV": "production", "PAYMENT_MODE": "mock"},
+            ),
+            patch("supabase_backend._authenticated_client", return_value=client),
+            patch("supabase_backend._service_client", return_value=service_client),
+            patch("supabase_backend._asaas_settings", return_value=("api-key", "https://api-sandbox.asaas.com/v3")),
+            patch("supabase_backend.requests.post", return_value=response) as asaas_post,
+        ):
+            result = create_service_payment("access-token", 123, "credit_card")
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["checkout_url"], response.json.return_value["link"])
+        asaas_post.assert_called_once()
+
+    def test_confirmed_payment_retry_does_not_replace_persisted_payment(self):
+        request_row = {
+            "id": 123,
+            "user_id": CUSTOMER_ID,
+            "provider_id": PROVIDER_ID,
+            "estimated_price": "57.84",
+            "status": "completed",
+        }
+        client = _request_client(request_row)
+        service_client = Mock()
+        service_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {"status": "confirmed"}
+        ]
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ENV": "test", "PAYMENT_MODE": "mock"},
+            ),
+            patch("supabase_backend._authenticated_client", return_value=client),
+            patch("supabase_backend._service_client", return_value=service_client),
+            patch("supabase_backend.requests.post") as asaas_post,
+        ):
+            result = create_service_payment("access-token", 123, "credit_card")
+
+        self.assertEqual(result["status"], "confirmed")
+        service_client.table.return_value.upsert.assert_not_called()
+        asaas_post.assert_not_called()
+
+    def test_mock_payment_still_requires_customer_ownership(self):
+        request_row = {
+            "id": 123,
+            "user_id": PROVIDER_ID,
+            "provider_id": CUSTOMER_ID,
+            "estimated_price": "57.84",
+            "status": "completed",
+        }
+        client = _request_client(request_row)
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ENV": "development", "PAYMENT_MODE": "mock"},
+            ),
+            patch("supabase_backend._authenticated_client", return_value=client),
+            patch("supabase_backend._service_client") as service_client,
+            self.assertRaises(SupabaseBackendError) as error,
+        ):
+            create_service_payment("access-token", 123, "credit_card")
+
+        self.assertEqual(error.exception.status_code, 403)
+        service_client.assert_not_called()
 
     def test_completed_status_is_required(self):
         request_row = {

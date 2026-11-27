@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import httpx
 import requests
+from postgrest.exceptions import APIError
 from supabase import Client, create_client
 from supabase.lib.client_options import SyncClientOptions
 
@@ -748,6 +749,12 @@ def _asaas_settings() -> tuple[str, str]:
     return api_key, api_url
 
 
+def _mock_payment_mode_enabled() -> bool:
+    payment_mode = os.getenv("PAYMENT_MODE", "").strip().lower()
+    app_environment = os.getenv("APP_ENV", "").strip().lower()
+    return payment_mode == "mock" and app_environment in {"development", "test"}
+
+
 def _asaas_error_codes(response: requests.Response) -> list[str]:
     try:
         body = response.json()
@@ -842,7 +849,9 @@ def create_service_payment(
         if not math.isfinite(amount) or amount <= 0:
             raise SupabaseBackendError(422, "Service request has no valid payment amount")
 
-        api_key, api_url = _asaas_settings()
+        mock_payment_mode = _mock_payment_mode_enabled()
+        if not mock_payment_mode:
+            api_key, api_url = _asaas_settings()
         service_client = _service_client()
         existing_rows = (
             service_client.table("service_request_payments")
@@ -855,8 +864,15 @@ def create_service_payment(
         if isinstance(existing_rows, list) and existing_rows:
             existing = existing_rows[0]
             if existing.get("status") == "confirmed":
+                if mock_payment_mode:
+                    return {
+                        "payment_method": payment_method,
+                        "status": "confirmed",
+                        "amount": amount,
+                        "checkout_url": "",
+                    }
                 raise SupabaseBackendError(409, "Service request payment is already confirmed")
-            if (
+            if not mock_payment_mode and (
                 existing.get("status") == "pending"
                 and existing.get("checkout_url")
                 and existing.get("payment_method") == payment_method
@@ -868,8 +884,44 @@ def create_service_payment(
                     "gateway_checkout_id": existing.get("gateway_checkout_id"),
                     "checkout_url": existing["checkout_url"],
                 }
-            if existing.get("status") == "pending" and existing.get("checkout_url"):
+            if (
+                not mock_payment_mode
+                and existing.get("status") == "pending"
+                and existing.get("checkout_url")
+            ):
                 raise SupabaseBackendError(409, "Another payment checkout is already pending")
+
+        if mock_payment_mode:
+            mock_payment = {
+                "service_request_id": int(request_id),
+                "customer_id": customer_id,
+                "provider_id": request.get("provider_id"),
+                "gateway": "mock",
+                "gateway_payment_id": None,
+                "gateway_checkout_id": None,
+                "checkout_url": None,
+                "payment_method": payment_method,
+                "amount": amount,
+                "status": "confirmed",
+                "gateway_payload": {"mode": "mock"},
+            }
+            try:
+                service_client.table("service_request_payments").upsert(
+                    mock_payment,
+                    on_conflict="service_request_id",
+                ).execute()
+            except (APIError, httpx.TransportError) as error:
+                logger.error(
+                    "Mock payment persistence failed for service request=%s",
+                    int(request_id),
+                )
+                raise _translate_error(error) from error
+            return {
+                "payment_method": payment_method,
+                "status": "confirmed",
+                "amount": amount,
+                "checkout_url": "",
+            }
 
         return_base_url = os.getenv("ASAAS_CHECKOUT_RETURN_URL", "").strip().rstrip("/")
         try:

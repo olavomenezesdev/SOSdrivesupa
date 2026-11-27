@@ -2815,10 +2815,14 @@ class OperationalState(rx.State):
             self.payment_amount = float(result.get("amount") or 0)
             self.checkout_url = str(result.get("checkout_url") or "")
             self.payment_status = str(result.get("status") or "pending")
-            self.payment_message = (
-                "Checkout seguro de cartão criado. O pagamento só será confirmado "
-                "após retorno autorizado do Asaas."
-            )
+            if self.payment_status == "confirmed":
+                self.payment_message = "Pagamento de teste aprovado."
+                yield rx.redirect("/review")
+            else:
+                self.payment_message = (
+                    "Checkout seguro de cartão criado. O pagamento só será confirmado "
+                    "após retorno autorizado do Asaas."
+                )
         except SupabaseAuthenticationError:
             self.payment_error = "Não foi possível autorizar o pagamento deste chamado."
         except SupabaseConfigurationRuntimeError:
